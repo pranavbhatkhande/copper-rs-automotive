@@ -13,7 +13,9 @@ use serde_big_array::BigArray;
 // ---------------------------------------------------------------------------
 
 /// A CAN bus identifier, either 11-bit standard or 29-bit extended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub enum CanId {
     /// Standard 11-bit identifier (0x000 – 0x7FF).
     Standard(u16),
@@ -56,7 +58,9 @@ impl fmt::Display for CanId {
 // ---------------------------------------------------------------------------
 
 /// Bit-flags for a classical CAN frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct CanFlags(pub u8);
 
 impl CanFlags {
@@ -75,7 +79,9 @@ impl CanFlags {
 }
 
 /// Bit-flags for a CAN FD frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct CanFdFlags(pub u8);
 
 impl CanFdFlags {
@@ -259,7 +265,9 @@ impl<const N: usize> CanFrameBatch<N> {
 // ---------------------------------------------------------------------------
 
 /// CAN bus error state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub enum CanBusState {
     /// Normal operation.
     #[default]
@@ -271,7 +279,9 @@ pub enum CanBusState {
 }
 
 /// CAN hardware error counters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct CanErrorCounters {
     /// Transmit Error Counter.
     pub tec: u16,
@@ -300,7 +310,15 @@ mod tests {
     #[test]
     fn can_fd_dlc_mapping() {
         let mut f = CanFdFrame::default();
-        for (dlc, expected) in [(0, 0), (8, 8), (9, 12), (12, 24), (13, 32), (14, 48), (15, 64)] {
+        for (dlc, expected) in [
+            (0, 0),
+            (8, 8),
+            (9, 12),
+            (12, 24),
+            (13, 32),
+            (14, 48),
+            (15, 64),
+        ] {
             f.dlc = dlc;
             assert_eq!(f.data_len(), expected);
         }

@@ -16,8 +16,10 @@ extern crate alloc;
 
 mod socketcan;
 
+use cu_automotive_payloads::CanFrame;
+#[cfg(feature = "mock")]
+use cu_automotive_payloads::CanId;
 use cu29::prelude::*;
-use cu_automotive_payloads::{CanFrame, CanId};
 
 // Re-export payload types for convenient use in RON configs
 pub use cu_automotive_payloads::CanFrame as CanFramePayload;
@@ -82,7 +84,7 @@ impl CuSrcTask for CanSource {
         // Non-blocking read in preprocess to keep process() fast
         #[cfg(all(target_os = "linux", not(feature = "mock")))]
         {
-            self.pending_frame = socketcan::read_frame_nonblocking(self.fd);
+            self.pending_frame = socketcan::read_frame_nonblocking(self.fd)?;
         }
 
         #[cfg(feature = "mock")]
@@ -122,7 +124,6 @@ impl CuSrcTask for CanSource {
 #[derive(Reflect)]
 #[reflect(from_reflect = false)]
 pub struct CanSink {
-    #[allow(dead_code)]
     #[allow(dead_code)]
     interface: alloc::string::String,
     #[cfg(all(target_os = "linux", not(feature = "mock")))]
@@ -239,5 +240,136 @@ impl CuTask for CanFilter {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cu_automotive_payloads::CanId;
+
+    fn make_frame(id: u16, data: &[u8]) -> CanFrame {
+        CanFrame::new(CanId::Standard(id), data)
+    }
+
+    fn make_filter(accept_id: Option<u32>, mask: u32) -> CanFilter {
+        CanFilter {
+            accept_id,
+            accept_mask: mask,
+        }
+    }
+
+    #[test]
+    fn filter_pass_all_when_no_id() {
+        let mut f = make_filter(None, 0x7FF);
+        let frame = make_frame(0x100, &[1, 2, 3]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_some());
+    }
+
+    #[test]
+    fn filter_match_exact_id() {
+        let mut f = make_filter(Some(0x100), 0x7FF);
+        let frame = make_frame(0x100, &[0xAA]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_some());
+    }
+
+    #[test]
+    fn filter_reject_wrong_id() {
+        let mut f = make_filter(Some(0x100), 0x7FF);
+        let frame = make_frame(0x200, &[0xBB]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_none());
+    }
+
+    #[test]
+    fn filter_mask_match() {
+        let mut f = make_filter(Some(0x100), 0x700);
+        let frame = make_frame(0x1FF, &[0xCC]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_some());
+    }
+
+    #[test]
+    fn filter_mask_reject() {
+        let mut f = make_filter(Some(0x100), 0x700);
+        let frame = make_frame(0x200, &[0xDD]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_none());
+    }
+
+    #[test]
+    fn filter_no_payload_no_output() {
+        let mut f = make_filter(None, 0x7FF);
+        let input = CuMsg::<CanFrame>::default();
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_none());
+    }
+
+    #[test]
+    fn filter_preserves_frame_data() {
+        let mut f = make_filter(None, 0x7FF);
+        let frame = make_frame(0x123, &[0x11, 0x22, 0x33, 0x44]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        let out_frame = output.payload().unwrap();
+        assert_eq!(out_frame.id.raw(), 0x123);
+        assert_eq!(out_frame.dlc, 4);
+        assert_eq!(&out_frame.data[..4], &[0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn frame_round_trip() {
+        let frame = make_frame(0x7FF, &[0xFF; 8]);
+        assert_eq!(frame.id.raw(), 0x7FF);
+        assert_eq!(frame.dlc, 8);
+        assert_eq!(&frame.data[..8], &[0xFF; 8]);
+    }
+
+    #[test]
+    fn extended_frame_id() {
+        let frame = CanFrame::new(CanId::Extended(0x1234_5678), &[0xAA, 0xBB]);
+        assert_eq!(frame.id.raw(), 0x1234_5678);
+        assert_eq!(frame.dlc, 2);
+    }
+
+    #[test]
+    fn filter_extended_id() {
+        let mut f = make_filter(Some(0x1234_5678), 0x1FFF_FFFF);
+        let frame = CanFrame::new(CanId::Extended(0x1234_5678), &[0x01]);
+        let input = CuMsg::<CanFrame>::new(Some(frame));
+        let mut output = CuMsg::<CanFrame>::default();
+        let ctx = CuContext::new_with_clock();
+        f.process(&ctx, &input, &mut output).unwrap();
+        assert!(output.payload().is_some());
+    }
+
+    #[cfg(feature = "mock")]
+    #[test]
+    fn mock_source_produces_frames() {
+        let mut src = CanSource::new(None, ()).unwrap();
+        let ctx = CuContext::new_with_clock();
+        src.preprocess(&ctx).unwrap();
+        assert!(src.pending_frame.is_some());
     }
 }

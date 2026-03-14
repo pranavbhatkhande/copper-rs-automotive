@@ -1,7 +1,7 @@
 //! SOME/IP UDP Sink — sends SOME/IP messages to the network.
 
+use cu_automotive_payloads::someip::{SOMEIP_HEADER_SIZE, SOMEIP_MAX_PAYLOAD_SIZE, SomeIpMessage};
 use cu29::prelude::*;
-use cu_automotive_payloads::someip::{SomeIpMessage, SOMEIP_HEADER_SIZE, SOMEIP_MAX_PAYLOAD_SIZE};
 
 /// Send buffer size.
 #[allow(dead_code)]
@@ -55,7 +55,9 @@ impl CuSinkTask for SomeIpSink {
             unsafe {
                 let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
                 if fd < 0 {
-                    return Err(CuError::from("Failed to create UDP socket for SOME/IP sink"));
+                    return Err(CuError::from(
+                        "Failed to create UDP socket for SOME/IP sink",
+                    ));
                 }
 
                 let ip_parts: alloc::vec::Vec<u8> = remote_addr
@@ -100,7 +102,7 @@ impl CuSinkTask for SomeIpSink {
                 let mut buf = [0u8; TX_BUF_SIZE];
                 let len = _msg.to_wire(&mut buf);
                 unsafe {
-                    libc::sendto(
+                    let n = libc::sendto(
                         self.fd,
                         buf.as_ptr() as *const libc::c_void,
                         len,
@@ -108,6 +110,9 @@ impl CuSinkTask for SomeIpSink {
                         &self.dest as *const libc::sockaddr_in as *const libc::sockaddr,
                         core::mem::size_of::<libc::sockaddr_in>() as u32,
                     );
+                    if n < 0 {
+                        return Err(CuError::from("SOME/IP sendto failed"));
+                    }
                 }
             }
 

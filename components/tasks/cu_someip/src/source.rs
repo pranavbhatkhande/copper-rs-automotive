@@ -1,7 +1,7 @@
 //! SOME/IP UDP Source — receives SOME/IP messages from the network.
 
+use cu_automotive_payloads::someip::{SOMEIP_HEADER_SIZE, SOMEIP_MAX_PAYLOAD_SIZE, SomeIpMessage};
 use cu29::prelude::*;
-use cu_automotive_payloads::someip::{SomeIpMessage, SOMEIP_HEADER_SIZE, SOMEIP_MAX_PAYLOAD_SIZE};
 
 /// Receive buffer size (header + max payload).
 #[allow(dead_code)]
@@ -41,10 +41,8 @@ impl SomeIpSource {
             }
 
             // Parse address
-            let ip_parts: alloc::vec::Vec<u8> = addr
-                .split('.')
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let ip_parts: alloc::vec::Vec<u8> =
+                addr.split('.').filter_map(|s| s.parse().ok()).collect();
             let ip_addr: u32 = if ip_parts.len() == 4 {
                 u32::from_be_bytes([ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]])
             } else {
@@ -117,9 +115,19 @@ impl CuSrcTask for SomeIpSource {
         {
             let mut buf = [0u8; RX_BUF_SIZE];
             unsafe {
-                let n = libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, RX_BUF_SIZE, 0);
+                let n = libc::recv(
+                    self.fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    RX_BUF_SIZE,
+                    0,
+                );
                 if n > 0 {
                     self.pending_msg = SomeIpMessage::from_wire(&buf[..n as usize]);
+                } else if n < 0 {
+                    let errno = *libc::__errno_location();
+                    if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                        return Err(CuError::from("SOME/IP recv failed"));
+                    }
                 }
             }
         }

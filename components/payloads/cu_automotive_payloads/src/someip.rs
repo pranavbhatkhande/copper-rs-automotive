@@ -5,8 +5,8 @@
 //! Also includes Service Discovery (SD) entry types.
 
 use bincode::{Decode, Encode};
-use cu29::prelude::*;
 use core::fmt;
+use cu29::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
@@ -22,7 +22,9 @@ pub const SOMEIP_SD_PORT: u16 = 30490;
 // ---------------------------------------------------------------------------
 
 /// SOME/IP message type field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 #[repr(u8)]
 pub enum SomeIpMessageType {
     #[default]
@@ -61,7 +63,9 @@ impl From<u8> for SomeIpMessageType {
 // ---------------------------------------------------------------------------
 
 /// SOME/IP return code.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 #[repr(u8)]
 pub enum SomeIpReturnCode {
     #[default]
@@ -113,7 +117,9 @@ impl From<u8> for SomeIpReturnCode {
 /// Byte  14:    Message Type
 /// Byte  15:    Return Code
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct SomeIpHeader {
     pub service_id: u16,
     pub method_id: u16,
@@ -311,8 +317,7 @@ impl SomeIpMessage {
         self.header.to_bytes(&mut hdr_buf);
         buf[..SOMEIP_HEADER_SIZE].copy_from_slice(&hdr_buf);
         let plen = self.payload_len as usize;
-        buf[SOMEIP_HEADER_SIZE..SOMEIP_HEADER_SIZE + plen]
-            .copy_from_slice(&self.payload[..plen]);
+        buf[SOMEIP_HEADER_SIZE..SOMEIP_HEADER_SIZE + plen].copy_from_slice(&self.payload[..plen]);
         SOMEIP_HEADER_SIZE + plen
     }
 
@@ -348,7 +353,9 @@ impl fmt::Display for SomeIpMessage {
 // ---------------------------------------------------------------------------
 
 /// SOME/IP Service Discovery entry type.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub enum SdEntryType {
     #[default]
     FindService,
@@ -361,7 +368,9 @@ pub enum SdEntryType {
 }
 
 /// A SOME/IP-SD service entry.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct SdServiceEntry {
     pub entry_type: SdEntryType,
     pub service_id: u16,
@@ -372,7 +381,9 @@ pub struct SdServiceEntry {
 }
 
 /// Current SOME/IP service availability (output of SD task).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct SomeIpServiceStatus {
     pub service_id: u16,
     pub instance_id: u16,

@@ -4,9 +4,9 @@
 //! kernel SocketCAN subsystem.
 
 #[cfg(all(target_os = "linux", not(feature = "mock")))]
-use cu29::prelude::*;
-#[cfg(all(target_os = "linux", not(feature = "mock")))]
 use cu_automotive_payloads::{CanFlags, CanFrame, CanId};
+#[cfg(all(target_os = "linux", not(feature = "mock")))]
+use cu29::prelude::*;
 
 #[cfg(all(target_os = "linux", not(feature = "mock")))]
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
@@ -75,9 +75,7 @@ pub fn open_can_socket(interface: &str) -> CuResult<i32> {
 
         if libc::ioctl(fd, SIOCGIFINDEX, &mut ifr as *mut Ifreq) < 0 {
             libc::close(fd);
-            return Err(alloc::format!(
-                "Failed to get interface index for '{}'", interface
-            ).into());
+            return Err(alloc::format!("Failed to get interface index for '{}'", interface).into());
         }
 
         let addr = SockaddrCan {
@@ -91,11 +89,10 @@ pub fn open_can_socket(interface: &str) -> CuResult<i32> {
             fd,
             &addr as *const SockaddrCan as *const libc::sockaddr,
             core::mem::size_of::<SockaddrCan>() as u32,
-        ) < 0 {
+        ) < 0
+        {
             libc::close(fd);
-            return Err(alloc::format!(
-                "Failed to bind CAN socket to '{}'", interface
-            ).into());
+            return Err(alloc::format!("Failed to bind CAN socket to '{}'", interface).into());
         }
 
         // Set non-blocking
@@ -107,8 +104,11 @@ pub fn open_can_socket(interface: &str) -> CuResult<i32> {
 }
 
 /// Non-blocking read of a single CAN frame.
+///
+/// Returns `Ok(None)` when no data is available (EAGAIN/EWOULDBLOCK).
+/// Returns `Err` on actual read errors.
 #[cfg(all(target_os = "linux", not(feature = "mock")))]
-pub fn read_frame_nonblocking(fd: i32) -> Option<CanFrame> {
+pub fn read_frame_nonblocking(fd: i32) -> CuResult<Option<CanFrame>> {
     unsafe {
         let mut raw = core::mem::zeroed::<RawCanFrame>();
         let n = libc::read(
@@ -116,8 +116,15 @@ pub fn read_frame_nonblocking(fd: i32) -> Option<CanFrame> {
             &mut raw as *mut RawCanFrame as *mut libc::c_void,
             core::mem::size_of::<RawCanFrame>(),
         );
-        if n < core::mem::size_of::<RawCanFrame>() as isize {
-            return None;
+        if n < 0 {
+            let errno = *libc::__errno_location();
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                return Ok(None);
+            }
+            return Err(alloc::format!("CAN read error (errno={})", errno).into());
+        }
+        if (n as usize) < core::mem::size_of::<RawCanFrame>() {
+            return Ok(None);
         }
 
         let id = if raw.can_id & CAN_EFF_FLAG != 0 {
@@ -134,12 +141,12 @@ pub fn read_frame_nonblocking(fd: i32) -> Option<CanFrame> {
             flags = CanFlags(flags.0 | CanFlags::ERR.0);
         }
 
-        Some(CanFrame {
+        Ok(Some(CanFrame {
             id,
             dlc: raw.can_dlc.min(8),
             data: raw.data,
             flags,
-        })
+        }))
     }
 }
 
@@ -177,5 +184,7 @@ pub fn write_frame(fd: i32, frame: &CanFrame) -> CuResult<()> {
 /// Close the socket.
 #[cfg(all(target_os = "linux", not(feature = "mock")))]
 pub fn close_socket(fd: i32) {
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
 }

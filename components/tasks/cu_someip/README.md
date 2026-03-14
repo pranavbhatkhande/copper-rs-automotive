@@ -19,7 +19,7 @@ Provides UDP-based SOME/IP source, sink, router, and service discovery monitor. 
 (
     id: "someip_src",
     type: "cu_someip::SomeIpSource",
-    config: { "bind_addr": "0.0.0.0", "port": 30490 },
+    config: { "bind_addr": "0.0.0.0", "bind_port": 30490 },
 ),
 (
     id: "someip_router",
@@ -28,7 +28,7 @@ Provides UDP-based SOME/IP source, sink, router, and service discovery monitor. 
 (
     id: "someip_sink",
     type: "cu_someip::SomeIpSink",
-    config: { "dest_addr": "127.0.0.1", "dest_port": 30491 },
+    config: { "remote_addr": "127.0.0.1", "remote_port": 30491 },
 ),
 ```
 
