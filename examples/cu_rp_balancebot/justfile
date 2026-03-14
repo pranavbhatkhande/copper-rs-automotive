@@ -48,6 +48,20 @@ web:
 	just prepare-assets
 	trunk serve --open
 
+# Build a static browser bundle into dist/balancebot with hashed asset filenames.
+web-dist:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	if ! command -v trunk >/dev/null 2>&1; then
+		echo "Missing trunk. Install with: cargo install --locked trunk" >&2
+		exit 1
+	fi
+	cd "{{invocation_directory()}}"
+	just prepare-assets
+	rm -rf dist/balancebot
+	trunk build --release --public-url ./ --dist dist/balancebot
+	echo "Static web bundle written to ${PWD}/dist/balancebot"
+
 # Extract a text log using the balancebot logreader.
 text-logs:
 	#!/usr/bin/env bash
