@@ -17,7 +17,9 @@ pub const ISOTP_MAX_PDU_SIZE: usize = 4095;
 // ---------------------------------------------------------------------------
 
 /// ISO-TP addressing mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub enum IsotpAddressingMode {
     /// Normal addressing — CAN ID identifies the logical channel.
     #[default]
@@ -60,7 +62,9 @@ impl Default for IsotpFrameType {
 // ---------------------------------------------------------------------------
 
 /// Flow control status field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub enum FlowStatus {
     /// Continue To Send.
     #[default]
@@ -72,7 +76,9 @@ pub enum FlowStatus {
 }
 
 /// Flow control parameters received from the peer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct FlowControlParams {
     /// Flow status.
     pub status: FlowStatus,
@@ -87,9 +93,9 @@ impl FlowControlParams {
     /// Returns the separation time minimum as microseconds.
     pub fn st_min_us(&self) -> u64 {
         match self.st_min {
-            0x00..=0x7F => self.st_min as u64 * 1000, // ms → μs
+            0x00..=0x7F => self.st_min as u64 * 1000,         // ms → μs
             0xF1..=0xF9 => (self.st_min - 0xF0) as u64 * 100, // 100–900 μs
-            _ => 127_000, // Reserved values → use max
+            _ => 127_000,                                     // Reserved values → use max
         }
     }
 }
@@ -175,7 +181,9 @@ impl fmt::Display for IsotpPdu {
 // ---------------------------------------------------------------------------
 
 /// ISO-TP transfer direction.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub enum IsotpDirection {
     #[default]
     Idle,
@@ -203,10 +211,7 @@ mod tests {
         };
         assert_eq!(fc.st_min_us(), 10_000);
 
-        let fc2 = FlowControlParams {
-            st_min: 0xF3,
-            ..fc
-        };
+        let fc2 = FlowControlParams { st_min: 0xF3, ..fc };
         assert_eq!(fc2.st_min_us(), 300);
     }
 }

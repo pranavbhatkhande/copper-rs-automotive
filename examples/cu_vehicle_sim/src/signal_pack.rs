@@ -79,8 +79,7 @@ pub fn get_raw_value(data: &[u8], sig: &DbcSignalDef) -> u64 {
             ((i as u16) + 1) * 8 - 1
         };
         let size = (msb_byte - lsb_byte + 1) as u32;
-        let d = ((data[i] >> (lsb_byte as u32 - (i as u32) * 8)) as u64)
-            & ((1u64 << size) - 1);
+        let d = ((data[i] >> (lsb_byte as u32 - (i as u32) * 8)) as u64) & ((1u64 << size) - 1);
         ret |= d << (bits_remaining - size);
         bits_remaining -= size;
 

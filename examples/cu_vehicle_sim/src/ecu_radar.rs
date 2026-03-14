@@ -7,10 +7,10 @@
 //! Each radar track simulates a vehicle at a given distance and relative speed,
 //! with values that evolve over time to produce a realistic CAN trace.
 
-use cu29::prelude::*;
 use cu_automotive_payloads::can::{CanFrame, CanId};
+use cu29::prelude::*;
 
-use crate::dbc_generated::{DBC_MESSAGES, DBC_MESSAGE_COUNT};
+use crate::dbc_generated::{DBC_MESSAGE_COUNT, DBC_MESSAGES};
 use crate::signal_pack::pack_signal;
 use crate::toyota_checksum::apply_toyota_checksum;
 
@@ -154,8 +154,20 @@ impl ToyotaRadarEcu {
                 "LONG_DIST" => track.long_dist,
                 "LAT_DIST" => track.lat_dist,
                 "REL_SPEED" => track.rel_speed,
-                "VALID" => if track.valid { 1.0 } else { 0.0 },
-                "NEW_TRACK" => if track.new_track { 1.0 } else { 0.0 },
+                "VALID" => {
+                    if track.valid {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                "NEW_TRACK" => {
+                    if track.new_track {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
                 _ => 0.0,
             };
             pack_signal(data, sig, value);
@@ -191,7 +203,9 @@ impl ToyotaRadarEcu {
             let value = match sig.name {
                 // Simulated signal values that change slowly
                 "NEW_SIGNAL_1" => ((self.tick as f64 * 0.02).sin() * 50.0 + 60.0).clamp(0.0, 127.0),
-                "NEW_SIGNAL_2" => ((self.tick as f64 * 0.03).cos() * 100.0 + 128.0).clamp(0.0, 255.0),
+                "NEW_SIGNAL_2" => {
+                    ((self.tick as f64 * 0.03).cos() * 100.0 + 128.0).clamp(0.0, 255.0)
+                }
                 _ => 0.0,
             };
             pack_signal(data, sig, value);
@@ -233,9 +247,9 @@ impl CuSrcTask for ToyotaRadarEcu {
 
         // Determine which message group this belongs to and pack signals
         match idx {
-            0..=15 => self.pack_track_a(idx, idx, &mut data),         // TRACK_A_0..15
-            16..=31 => self.pack_track_b(idx, idx - 16, &mut data),   // TRACK_B_0..15
-            32..=33 => self.pack_new_msg(idx, &mut data),             // NEW_MSG_1, NEW_MSG_2
+            0..=15 => self.pack_track_a(idx, idx, &mut data), // TRACK_A_0..15
+            16..=31 => self.pack_track_b(idx, idx - 16, &mut data), // TRACK_B_0..15
+            32..=33 => self.pack_new_msg(idx, &mut data),     // NEW_MSG_1, NEW_MSG_2
             _ => {}
         }
 

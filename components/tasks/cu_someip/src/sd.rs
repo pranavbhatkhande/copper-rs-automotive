@@ -3,10 +3,10 @@
 //! Listens for SOME/IP-SD multicast announcements (OfferService, StopOffer)
 //! and tracks which services are available on the network.
 
-use cu29::prelude::*;
 use cu_automotive_payloads::someip::{
     SdEntryType, SdServiceEntry, SomeIpMessage, SomeIpServiceStatus,
 };
+use cu29::prelude::*;
 
 /// Maximum tracked services.
 const MAX_TRACKED_SERVICES: usize = 32;
@@ -47,7 +47,7 @@ impl Freezable for SomeIpSdMonitor {}
 impl SomeIpSdMonitor {
     /// Parse SD entries from the SOME/IP payload.
     /// This is a simplified parser for OfferService entries.
-    fn parse_sd_entries(payload: &[u8]) -> alloc::vec::Vec<SdServiceEntry> {
+    pub fn parse_sd_entries(payload: &[u8]) -> alloc::vec::Vec<SdServiceEntry> {
         let mut entries = alloc::vec::Vec::new();
         if payload.len() < 12 {
             return entries;
@@ -55,18 +55,15 @@ impl SomeIpSdMonitor {
         // SD payload format:
         // [0..3] flags (reboot, unicast)
         // [4..7] length of entries array
-        let entries_len = u32::from_be_bytes([
-            payload[4], payload[5], payload[6], payload[7],
-        ]) as usize;
+        let entries_len =
+            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
 
         let entry_data = &payload[8..];
         let mut offset = 0;
-        while offset + 16 <= entry_data.len().min(8 + entries_len) {
+        while offset + 16 <= entry_data.len().min(entries_len) {
             let entry_type_byte = entry_data[offset];
-            let service_id =
-                u16::from_be_bytes([entry_data[offset + 4], entry_data[offset + 5]]);
-            let instance_id =
-                u16::from_be_bytes([entry_data[offset + 6], entry_data[offset + 7]]);
+            let service_id = u16::from_be_bytes([entry_data[offset + 4], entry_data[offset + 5]]);
+            let instance_id = u16::from_be_bytes([entry_data[offset + 6], entry_data[offset + 7]]);
             let major_version = entry_data[offset + 8];
             let ttl = u32::from_be_bytes([
                 0,

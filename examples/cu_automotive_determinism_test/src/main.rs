@@ -1,7 +1,10 @@
-//! CAN Bus Example
+//! Automotive Determinism Test
 //!
-//! Demonstrates a CAN bus pipeline: CanSource → CanFilter → CanSink.
-//! Uses mock mode (no real SocketCAN hardware required).
+//! Verifies that automotive protocol tasks (UDS server with timers)
+//! produce bit-identical results across independent runs, proving
+//! the stack is fully deterministic under Copper's mock clock.
+
+pub mod tasks;
 
 use cu29::prelude::*;
 use cu29_helpers::basic_copper_setup;
@@ -9,12 +12,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[copper_runtime(config = "copperconfig.ron")]
-struct CanExampleApplication {}
+struct AutoDetApp {}
 
 const SLAB_SIZE: Option<usize> = Some(64 * 1024 * 1024);
 
 fn main() {
-    let logger_path = "logs/can_example.copper";
+    let logger_path = "logs/automotive_det.copper";
     if let Some(parent) = Path::new(logger_path).parent()
         && !parent.exists()
     {
@@ -23,13 +26,16 @@ fn main() {
 
     let copper_ctx = basic_copper_setup(&PathBuf::from(logger_path), SLAB_SIZE, true, None)
         .expect("Failed to setup logger.");
-    let mut application = CanExampleApplicationBuilder::new()
+    let mut application = AutoDetAppBuilder::new()
         .with_context(&copper_ctx)
         .build()
-        .expect("Failed to create CAN example application.");
+        .expect("Failed to create application.");
 
-    println!("Starting CAN example pipeline (CanSource → CanFilter → CanSink)...");
+    println!("Starting automotive determinism test...");
     if let Err(error) = application.run() {
         println!("Application ended: {error}");
     }
 }
+
+#[cfg(all(test, feature = "determinism_ci"))]
+mod determinism_test;

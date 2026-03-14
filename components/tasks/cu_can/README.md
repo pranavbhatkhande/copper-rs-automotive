@@ -32,6 +32,12 @@ Provides `CuSrcTask`, `CuSinkTask`, and `CuTask` implementations for interfacing
 ),
 ```
 
+## Error Handling
+
+- `CanSource` distinguishes EAGAIN/EWOULDBLOCK (no data available) from real socket errors
+- Socket read errors are surfaced as `CuError`, not silently swallowed
+- `CanSink` checks write return values and propagates failures
+
 ## Features
 
 - `mock` — Enables mock mode (no SocketCAN hardware required). CanSource generates synthetic frames; CanSink counts without transmitting.

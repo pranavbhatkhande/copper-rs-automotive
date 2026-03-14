@@ -4,13 +4,11 @@
 //! messages and tags them for dispatch. In a simple setup, it can serve
 //! as an echo/handler for known service IDs.
 
+use cu_automotive_payloads::someip::{SomeIpMessage, SomeIpReturnCode};
 use cu29::prelude::*;
-use cu_automotive_payloads::someip::{
-    SomeIpMessage, SomeIpReturnCode,
-};
 
 /// Maximum number of registered services.
-const MAX_SERVICES: usize = 16;
+const MAX_SERVICES: usize = 32;
 
 /// A registered service handler entry.
 #[derive(Clone, Debug, Default)]

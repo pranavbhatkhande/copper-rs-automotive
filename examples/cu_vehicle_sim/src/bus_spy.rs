@@ -4,10 +4,10 @@
 //! DBC database, unpacks all signals to physical values, and prints a human-readable summary.
 //! Validates Toyota checksums and counter continuity.
 
-use cu29::prelude::*;
 use cu_automotive_payloads::can::CanFrame;
+use cu29::prelude::*;
 
-use crate::dbc_generated::{DBC_MESSAGES, DBC_MESSAGE_COUNT, DbcMessageDef};
+use crate::dbc_generated::{DBC_MESSAGE_COUNT, DBC_MESSAGES, DbcMessageDef};
 use crate::signal_pack::unpack_signal;
 use crate::toyota_checksum::toyota_checksum;
 
@@ -84,10 +84,14 @@ impl CanBusSpy {
     /// Print a summary of all tracked signals.
     fn print_summary(&self) {
         println!("╔══════════════════════════════════════════════════════════════════╗");
-        println!("║  Vehicle CAN Bus Summary — {} frames received                ║",
-               self.frame_count);
-        println!("║  Checksum errors: {}  Counter errors: {}                      ║",
-               self.checksum_errors, self.counter_errors);
+        println!(
+            "║  Vehicle CAN Bus Summary — {} frames received                ║",
+            self.frame_count
+        );
+        println!(
+            "║  Checksum errors: {}  Counter errors: {}                      ║",
+            self.checksum_errors, self.counter_errors
+        );
         println!("╠══════════════════════════════════════════════════════════════════╣");
 
         // Print a few interesting tracks

@@ -10,12 +10,12 @@
 //!
 //! All messages include proper Toyota checksums and auto-incrementing counters.
 
+mod bus_spy;
 #[allow(dead_code)]
 mod dbc_generated;
+mod ecu_radar;
 mod signal_pack;
 mod toyota_checksum;
-mod ecu_radar;
-mod bus_spy;
 
 use cu29::prelude::*;
 use cu29_helpers::basic_copper_setup;

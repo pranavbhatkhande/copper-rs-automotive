@@ -1,0 +1,46 @@
+// Automotive Determinism Test Pipeline:
+//   AutoTestSource → UdsServer → AutoTestSink
+//
+// The source generates a deterministic sequence of UDS requests
+// including session transitions, security access, and DID reads.
+// The server processes them. Time gaps trigger S3 timeout.
+(
+    tasks: [
+        (
+            id: "src",
+            type: "tasks::AutoTestSource",
+        ),
+        (
+            id: "uds",
+            type: "cu_uds::UdsServer",
+            config: {
+                "session_timeout_ms": 5000,
+                "p2_server_ms": 50,
+                "p2_star_server_ms": 5000,
+                "max_security_attempts": 3,
+                "security_lockout_ms": 10000,
+            },
+        ),
+        (
+            id: "sink",
+            type: "tasks::AutoTestSink",
+        ),
+    ],
+    cnx: [
+        (
+            src: "src",
+            dst: "uds",
+            msg: "cu_automotive_payloads::isotp::IsotpPdu",
+        ),
+        (
+            src: "uds",
+            dst: "sink",
+            msg: "cu_automotive_payloads::isotp::IsotpPdu",
+        ),
+    ],
+    logging: (
+        keyframe_interval: 32,
+        slab_size_mib: 64,
+        section_size_mib: 16,
+    ),
+)

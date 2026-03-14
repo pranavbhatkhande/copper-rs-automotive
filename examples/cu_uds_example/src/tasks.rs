@@ -3,9 +3,9 @@
 //! UdsTestSource — generates diagnostic requests as IsotpPdu payloads.
 //! UdsResponseSink — receives and logs UDS server responses.
 
-use cu29::prelude::*;
 use cu_automotive_payloads::isotp::IsotpPdu;
 use cu_automotive_payloads::uds::UdsResponse;
+use cu29::prelude::*;
 
 /// Cycles through a predefined set of UDS requests.
 #[derive(Reflect)]
@@ -81,7 +81,10 @@ impl CuSinkTask for UdsResponseSink {
                     );
                 }
             } else {
-                debug!("[UDS RX #{}] Raw ISO-TP PDU: {} bytes", self.rx_count, pdu.len);
+                debug!(
+                    "[UDS RX #{}] Raw ISO-TP PDU: {} bytes",
+                    self.rx_count, pdu.len
+                );
             }
             self.rx_count += 1;
         }

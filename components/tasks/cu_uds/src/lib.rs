@@ -10,8 +10,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-mod server;
 mod client;
+mod server;
 
-pub use server::UdsServer;
 pub use client::UdsClient;
+pub use server::UdsServer;

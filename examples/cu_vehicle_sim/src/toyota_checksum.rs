@@ -18,6 +18,10 @@
 /// The checksum is: `(dlc + sum_of_address_bytes + sum_of_data_bytes_except_last) & 0xFF`
 /// The checksum itself occupies the last byte of the message (bit position 63:56 in big-endian).
 pub fn toyota_checksum(address: u32, data: &[u8]) -> u8 {
+    if data.is_empty() {
+        return 0;
+    }
+
     let mut s: u32 = data.len() as u32;
 
     // Sum address bytes
@@ -39,6 +43,9 @@ pub fn toyota_checksum(address: u32, data: &[u8]) -> u8 {
 ///
 /// Computes the checksum and writes it to `data[dlc - 1]` (the last byte).
 pub fn apply_toyota_checksum(address: u32, data: &mut [u8]) {
+    if data.is_empty() {
+        return;
+    }
     let cksum = toyota_checksum(address, data);
     let last = data.len() - 1;
     data[last] = cksum;
@@ -74,5 +81,21 @@ mod tests {
         let first = data[7];
         apply_toyota_checksum(0x180, &mut data);
         assert_eq!(data[7], first, "Checksum should be idempotent");
+    }
+
+    #[test]
+    fn checksum_empty_data() {
+        // Empty data must not panic
+        assert_eq!(toyota_checksum(0x180, &[]), 0);
+        apply_toyota_checksum(0x180, &mut []);
+    }
+
+    #[test]
+    fn checksum_single_byte() {
+        // Single byte: the last byte IS the checksum byte, no data bytes summed
+        let mut data = [0u8; 1];
+        apply_toyota_checksum(0x180, &mut data);
+        // sum = 1 (dlc) + 0x01 + 0x80 (addr) = 130 = 0x82
+        assert_eq!(data[0], 0x82);
     }
 }

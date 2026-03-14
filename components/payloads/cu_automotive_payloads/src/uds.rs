@@ -4,8 +4,8 @@
 //! and Negative Response Codes (NRC).
 
 use bincode::{Decode, Encode};
-use cu29::prelude::*;
 use core::fmt;
+use cu29::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
@@ -17,7 +17,9 @@ pub const UDS_MAX_PAYLOAD_SIZE: usize = 4093;
 // ---------------------------------------------------------------------------
 
 /// UDS diagnostic session type (ISO 14229-1 §9.2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 #[repr(u8)]
 pub enum UdsSessionType {
     #[default]
@@ -99,7 +101,9 @@ impl From<u8> for UdsServiceId {
 // ---------------------------------------------------------------------------
 
 /// UDS Negative Response Code (NRC) — ISO 14229-1 Annex A.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 #[repr(u8)]
 pub enum Nrc {
     #[default]
@@ -343,7 +347,9 @@ impl UdsResponse {
 // ---------------------------------------------------------------------------
 
 /// Current UDS session state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
 pub struct UdsSessionState {
     /// Current active session.
     pub session_type: UdsSessionType,

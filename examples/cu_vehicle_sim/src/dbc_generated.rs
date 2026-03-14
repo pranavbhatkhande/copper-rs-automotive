@@ -3296,7 +3296,4 @@ pub const MSG_ID_NEW_MSG_2: u32 = 0x241;
 pub const DBC_MESSAGE_COUNT: usize = 34;
 pub const DBC_NAME: &str = "toyota_tss2_adas";
 
-pub static DBC_NODES: &[&str] = &[
-    "XXX",
-];
-
+pub static DBC_NODES: &[&str] = &["XXX"];

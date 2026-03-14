@@ -39,4 +39,3 @@ fn main() {
         println!("Application ended: {error}");
     }
 }
-
