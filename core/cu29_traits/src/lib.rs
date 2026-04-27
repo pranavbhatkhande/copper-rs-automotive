@@ -26,21 +26,29 @@ extern crate alloc;
 pub use bevy_reflect::Reflect;
 use bincode::de::{BorrowDecoder, Decoder};
 use bincode::enc::Encoder;
+use bincode::enc::write::Writer;
 use bincode::error::{DecodeError, EncodeError};
 use bincode::{BorrowDecode, Decode as dDecode, Decode, Encode, Encode as dEncode};
 use compact_str::CompactString;
 use cu29_clock::{PartialCuTimeRange, Tov};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use core::cell::Cell;
 #[cfg(not(feature = "std"))]
 use core::error::Error as CoreError;
 use core::fmt::{Debug, Display, Formatter};
 #[cfg(feature = "std")]
 use std::error::Error;
+
+#[cfg(not(feature = "std"))]
+use spin::Mutex as SpinMutex;
 
 // Type alias for the boxed error type to simplify conditional compilation
 #[cfg(feature = "std")]
@@ -309,6 +317,124 @@ where
 // Generic Result type for copper.
 pub type CuResult<T> = Result<T, CuError>;
 
+#[cfg(feature = "std")]
+thread_local! {
+    static OBSERVED_ENCODE_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(not(feature = "std"))]
+static OBSERVED_ENCODE_BYTES: SpinMutex<Option<usize>> = SpinMutex::new(None);
+
+/// Starts observed byte counting for the current encode pass.
+pub fn begin_observed_encode() {
+    #[cfg(feature = "std")]
+    OBSERVED_ENCODE_BYTES.with(|bytes| {
+        debug_assert!(
+            bytes.get().is_none(),
+            "observed encode measurement must not be nested"
+        );
+        bytes.set(Some(0));
+    });
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut bytes = OBSERVED_ENCODE_BYTES.lock();
+        debug_assert!(
+            bytes.is_none(),
+            "observed encode measurement must not be nested"
+        );
+        *bytes = Some(0);
+    }
+}
+
+/// Ends observed byte counting and returns the total bytes written.
+pub fn finish_observed_encode() -> usize {
+    #[cfg(feature = "std")]
+    {
+        OBSERVED_ENCODE_BYTES.with(|bytes| bytes.replace(None).unwrap_or(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        OBSERVED_ENCODE_BYTES.lock().take().unwrap_or(0)
+    }
+}
+
+/// Aborts any active observed byte counting session.
+pub fn abort_observed_encode() {
+    #[cfg(feature = "std")]
+    OBSERVED_ENCODE_BYTES.with(|bytes| bytes.set(None));
+
+    #[cfg(not(feature = "std"))]
+    {
+        *OBSERVED_ENCODE_BYTES.lock() = None;
+    }
+}
+
+/// Returns the number of bytes written so far in the current observed encode pass.
+pub fn observed_encode_bytes() -> usize {
+    #[cfg(feature = "std")]
+    {
+        OBSERVED_ENCODE_BYTES.with(|bytes| bytes.get().unwrap_or(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        OBSERVED_ENCODE_BYTES.lock().as_ref().copied().unwrap_or(0)
+    }
+}
+
+/// Records bytes written by an observed writer.
+pub fn record_observed_encode_bytes(bytes: usize) {
+    #[cfg(feature = "std")]
+    OBSERVED_ENCODE_BYTES.with(|total| {
+        if let Some(current) = total.get() {
+            total.set(Some(current.saturating_add(bytes)));
+        }
+    });
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut total = OBSERVED_ENCODE_BYTES.lock();
+        if let Some(current) = *total {
+            *total = Some(current.saturating_add(bytes));
+        }
+    }
+}
+
+/// A bincode writer wrapper that reports every encoded byte to Copper's
+/// observation counters.
+pub struct ObservedWriter<W> {
+    inner: W,
+}
+
+impl<W> ObservedWriter<W> {
+    pub const fn new(inner: W) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    pub fn inner(&self) -> &W {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+}
+
+impl<W: Writer> Writer for ObservedWriter<W> {
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
+        self.inner.write(bytes)?;
+        record_observed_encode_bytes(bytes.len());
+        Ok(())
+    }
+}
+
 /// Defines a basic write, append only stream trait to be able to log or send serializable objects.
 pub trait WriteStream<E: Encode>: Debug + Send + Sync {
     fn log(&mut self, obj: &E) -> CuResult<()>;
@@ -336,6 +462,15 @@ pub trait Metadata: Default + Debug + Clone + Encode + Decode<()> + Serialize {}
 
 impl Metadata for () {}
 
+/// Origin metadata captured when a Copper-aware transport receives a remote message.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
+pub struct CuMsgOrigin {
+    pub subsystem_code: u16,
+    pub instance_id: u32,
+    pub cl_id: u64,
+}
+
 /// Key metadata piece attached to every message in Copper.
 pub trait CuMsgMetadataTrait {
     /// The time range used for the processing of this message
@@ -343,6 +478,11 @@ pub trait CuMsgMetadataTrait {
 
     /// Small status text for user UI to get the realtime state of task (max 24 chrs)
     fn status_txt(&self) -> &CuCompactString;
+
+    /// Remote Copper provenance captured on receive.
+    fn origin(&self) -> Option<&CuMsgOrigin> {
+        None
+    }
 }
 
 /// A generic trait to expose the generated CuStampedDataSet from the task graph.
@@ -371,8 +511,147 @@ pub trait CuPayloadRawBytes {
 ///
 /// The returned slice must be aligned with `ErasedCuStampedDataSet::cumsgs()`:
 /// index `i` maps to copperlist slot `i`.
+#[derive(Debug, Clone, Copy)]
+pub struct TaskOutputSpec {
+    pub task_id: &'static str,
+    pub msg_type: &'static str,
+    pub payload_type_path_fn: fn() -> &'static str,
+}
+
+impl TaskOutputSpec {
+    #[inline]
+    pub fn payload_type_path(&self) -> &'static str {
+        (self.payload_type_path_fn)()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DebugFieldSemantics {
+    Time,
+    OptionalTime,
+    Duration,
+    GeodeticPosition,
+    Quantity {
+        quantity_name: String,
+        unit_symbol: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugFieldKind {
+    Scalar,
+    Struct,
+    TupleStruct,
+    Tuple,
+    List,
+    Array,
+    Map,
+    Set,
+    Enum,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DebugFieldDescriptor {
+    pub display_path: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_debug_binding_name"
+    )]
+    pub binding_name: Option<String>,
+    pub field_type: String,
+    pub value_type_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<DebugFieldSemantics>,
+    pub nullable: bool,
+    pub kind: DebugFieldKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<DebugFieldDescriptor>,
+}
+
+fn deserialize_debug_binding_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BindingNameVisitor;
+
+    impl<'de> Visitor<'de> for BindingNameVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("a string, null, or an empty sequence")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserialize_debug_binding_name(deserializer)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value.to_owned()))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if seq.next_element::<de::IgnoredAny>()?.is_none() {
+                return Ok(None);
+            }
+            Err(de::Error::invalid_type(
+                de::Unexpected::Seq,
+                &"an empty sequence",
+            ))
+        }
+    }
+
+    deserializer.deserialize_any(BindingNameVisitor)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugScalarRegistration {
+    pub type_path: &'static str,
+    pub field_type: &'static str,
+    pub semantics: DebugFieldSemantics,
+}
+
+pub trait DebugScalarType: 'static {
+    fn debug_scalar_registration() -> DebugScalarRegistration;
+}
+
 pub trait MatchingTasks {
     fn get_all_task_ids() -> &'static [&'static str];
+
+    fn get_output_specs() -> &'static [TaskOutputSpec] {
+        &[]
+    }
 }
 
 /// Trait for providing JSON schemas for CopperList payload types.
@@ -522,7 +801,8 @@ mod tests {
 // Tests that require std feature
 #[cfg(all(test, feature = "std"))]
 mod std_tests {
-    use crate::{CuError, with_cause};
+    use crate::{CuError, DebugFieldDescriptor, DebugFieldKind, DebugFieldSemantics, with_cause};
+    use serde_json::json;
 
     #[test]
     fn test_cuerror_from_str() {
@@ -629,5 +909,41 @@ mod std_tests {
         let debug = format!("{:?}", err);
         assert!(debug.contains("test error"));
         assert!(debug.contains("some context"));
+    }
+
+    #[test]
+    fn debug_field_descriptor_skips_missing_binding_name_on_serialize() {
+        let descriptor = DebugFieldDescriptor {
+            display_path: "meta.process_time.start_ns".to_owned(),
+            binding_name: None,
+            field_type: "integer".to_owned(),
+            value_type_path: "cu29_clock::CuTime".to_owned(),
+            semantics: Some(DebugFieldSemantics::Time),
+            nullable: true,
+            kind: DebugFieldKind::Scalar,
+            children: Vec::new(),
+        };
+
+        let encoded = serde_json::to_value(&descriptor).unwrap();
+        assert!(encoded.get("binding_name").is_none());
+    }
+
+    #[test]
+    fn debug_field_descriptor_accepts_empty_array_binding_name() {
+        let encoded = json!({
+            "display_path": "meta.process_time.start_ns",
+            "binding_name": [],
+            "field_type": "integer",
+            "value_type_path": "cu29_clock::CuTime",
+            "semantics": "Time",
+            "nullable": true,
+            "kind": "scalar",
+        });
+
+        let descriptor: DebugFieldDescriptor = serde_json::from_value(encoded).unwrap();
+        assert_eq!(descriptor.binding_name, None);
+        assert_eq!(descriptor.semantics, Some(DebugFieldSemantics::Time));
+        assert_eq!(descriptor.kind, DebugFieldKind::Scalar);
+        assert!(descriptor.children.is_empty());
     }
 }

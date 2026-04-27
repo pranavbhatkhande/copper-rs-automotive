@@ -1,4 +1,5 @@
 pub mod tasks;
+mod windowing;
 
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
@@ -28,7 +29,6 @@ const CAMERA_ZOOM_SPEED: f32 = 0.65;
 const COPPER_TICK_HZ: f32 = 10.0;
 #[cfg(not(target_arch = "wasm32"))]
 const LOG_SLAB_SIZE: Option<usize> = Some(64 * 1024 * 1024);
-const STRUCTURED_LOG_SECTION_SIZE: usize = 4096 * 10;
 
 #[copper_runtime(config = "copperconfig.ron")]
 struct BevyMonDemoApp {}
@@ -66,7 +66,6 @@ struct SplitUiCamera(Entity);
 
 #[derive(Resource)]
 struct CopperDriver {
-    _logger_runtime: LoggerRuntime,
     copper_app: BevyMonDemoApp,
     iteration_timer: Timer,
     started: bool,
@@ -93,48 +92,47 @@ fn main() {
     let mut copper = build_copper_driver();
     let monitor_model = copper.copper_app.copper_runtime_mut().monitor.model();
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(primary_window()),
-            ..default()
-        }))
-        .add_plugins(
-            CuBevyMonPlugin::new(monitor_model)
-                .with_initial_focus(CuBevyMonSurface::Sim)
-                .with_font_size(24)
-                .with_options(MonitorUiOptions {
-                    show_quit_hint: false,
-                }),
-        )
-        .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
-        .insert_resource(copper)
-        .init_resource::<LayoutSpawned>()
-        .init_resource::<DemoCameraRig>()
-        .add_systems(
-            Startup,
-            (setup_scene, setup_ui_camera, start_copper_runtime),
-        )
-        .add_systems(
-            Update,
-            (
-                spawn_demo_layout,
-                drive_sim_controls,
-                handle_sim_zoom,
-                sync_demo_camera,
-                animate_scene,
-                update_demo_hud,
-                run_copper_iteration,
-            ),
-        )
-        .add_systems(PostUpdate, stop_copper_on_exit)
-        .run();
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(primary_window()),
+        ..default()
+    }));
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, windowing::set_copper_window_icon);
+    app.add_plugins(
+        CuBevyMonPlugin::new(monitor_model)
+            .with_initial_focus(CuBevyMonSurface::Sim)
+            .with_font_size(24)
+            .with_options(MonitorUiOptions {
+                show_quit_hint: false,
+            }),
+    )
+    .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.07)))
+    .insert_resource(copper)
+    .init_resource::<LayoutSpawned>()
+    .init_resource::<DemoCameraRig>()
+    .add_systems(
+        Startup,
+        (setup_scene, setup_ui_camera, start_copper_runtime),
+    )
+    .add_systems(
+        Update,
+        (
+            spawn_demo_layout,
+            drive_sim_controls,
+            handle_sim_zoom,
+            sync_demo_camera,
+            animate_scene,
+            update_demo_hud,
+            run_copper_iteration,
+        ),
+    )
+    .add_systems(PostUpdate, stop_copper_on_exit);
+    app.run();
 }
 
 fn build_copper_driver() -> CopperDriver {
-    let clock = RobotClock::default();
     let unified_logger = build_unified_logger().expect("Failed to create demo logger.");
-    let logger_runtime = init_logger_runtime(&clock, unified_logger.clone())
-        .expect("Failed to initialize Copper structured logging.");
 
     #[cfg(target_arch = "wasm32")]
     debug!("Using no-op unified logger for wasm BevyMon demo.");
@@ -143,15 +141,12 @@ fn build_copper_driver() -> CopperDriver {
 
     debug!("Creating Copper BevyMon demo application.");
 
-    let copper_app = <BevyMonDemoApp as CuApplication<DemoSectionStorage, DemoUnifiedLogger>>::new(
-        clock,
-        unified_logger,
-        None,
-    )
-    .expect("Failed to create Copper runtime.");
+    let copper_app = BevyMonDemoApp::builder()
+        .with_logger::<DemoSectionStorage, DemoUnifiedLogger>(unified_logger)
+        .build()
+        .expect("Failed to create Copper runtime.");
 
     CopperDriver {
-        _logger_runtime: logger_runtime,
         copper_app,
         iteration_timer: Timer::from_seconds(1.0 / COPPER_TICK_HZ, TimerMode::Repeating),
         started: false,
@@ -171,6 +166,7 @@ fn start_copper_runtime(mut copper: ResMut<CopperDriver>) {
 fn primary_window() -> Window {
     Window {
         title: "Copper BevyMon Demo".into(),
+        name: Some("io.github.copper-project.bevymon-demo".into()),
         resolution: (1600, 900).into(),
         ..default()
     }
@@ -185,22 +181,6 @@ fn primary_window() -> Window {
         fit_canvas_to_parent: true,
         ..default()
     }
-}
-
-fn init_logger_runtime(
-    clock: &RobotClock,
-    unified_logger: Arc<Mutex<DemoUnifiedLogger>>,
-) -> CuResult<LoggerRuntime> {
-    let structured_stream = stream_write::<CuLogEntry, DemoSectionStorage>(
-        unified_logger,
-        UnifiedLogType::StructuredLogLine,
-        STRUCTURED_LOG_SECTION_SIZE,
-    )?;
-    Ok(LoggerRuntime::init(
-        clock.clone(),
-        structured_stream,
-        None::<NullLog>,
-    ))
 }
 
 #[cfg(target_arch = "wasm32")]

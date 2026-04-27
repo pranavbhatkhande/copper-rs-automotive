@@ -6,6 +6,7 @@ readme = "README.md"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -26,3 +27,4 @@ tempfile = { workspace = true }
 default = ["std", "compact"]
 std = ["dep:memmap2", "dep:page_size", "cu29-traits/std", "bincode/std"]
 compact = []                                                             # favor compactness over pure memory page alignment in the log
+mmap-fsync = ["std"]

@@ -133,9 +133,38 @@ impl ComponentConfig {
     }
 
     #[allow(dead_code)]
+    pub fn deserialize_into<T>(&self) -> Result<T, ConfigError>
+    where
+        T: DeserializeOwned,
+    {
+        let mut map = BTreeMap::new();
+        for (key, value) in &self.0 {
+            let mapped_value = ron_value_to_cu_value(&value.0).map_err(|err| err.with_key(key))?;
+            map.insert(CuValue::String(key.clone()), mapped_value);
+        }
+
+        CuValue::Map(map)
+            .deserialize_into::<T>()
+            .map_err(|err| ConfigError {
+                message: format!(
+                    "Config failed to deserialize as {}: {err}",
+                    type_name::<T>()
+                ),
+            })
+    }
+
+    #[allow(dead_code)]
     pub fn set<T: Into<Value>>(&mut self, key: &str, value: T) {
         let ComponentConfig(config) = self;
         config.insert(key.to_string(), value.into());
+    }
+
+    #[allow(dead_code)]
+    pub fn merge_from(&mut self, other: &ComponentConfig) {
+        let ComponentConfig(config) = self;
+        for (key, value) in &other.0 {
+            config.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -180,7 +209,7 @@ fn ron_value_to_cu_value(value: &RonValue) -> Result<CuValue, ConfigError> {
             Number::U64(v) => Ok(CuValue::U64(*v)),
             Number::F32(v) => Ok(CuValue::F32(v.0)),
             Number::F64(v) => Ok(CuValue::F64(v.0)),
-            Number::__NonExhaustive(_) => Err(ConfigError {
+            _ => Err(ConfigError {
                 message: "Unsupported RON number variant".to_string(),
             }),
         },
@@ -285,7 +314,10 @@ macro_rules! impl_from_value_for_int {
                             Number::U16(n) => n as $target,
                             Number::U32(n) => n as $target,
                             Number::U64(n) => n as $target,
-                            Number::F32(_) | Number::F64(_) | Number::__NonExhaustive(_) => {
+                            Number::F32(_) | Number::F64(_) => {
+                                panic!("Expected an integer Number variant but got {num:?}")
+                            }
+                            _ => {
                                 panic!("Expected an integer Number variant but got {num:?}")
                             }
                         }
@@ -317,7 +349,10 @@ macro_rules! impl_try_from_value_for_int {
                             Number::U16(n) => Ok(*n as $target),
                             Number::U32(n) => Ok(*n as $target),
                             Number::U64(n) => Ok(*n as $target),
-                            Number::F32(_) | Number::F64(_) | Number::__NonExhaustive(_) => {
+                            Number::F32(_) | Number::F64(_) => {
+                                Err(ConfigError::type_mismatch("integer", value))
+                            }
+                            _ => {
                                 Err(ConfigError::type_mismatch("integer", value))
                             }
                         }
@@ -348,7 +383,7 @@ impl TryFrom<&Value> for f64 {
                 Number::U64(n) => *n as f64,
                 Number::F32(n) => n.0 as f64,
                 Number::F64(n) => n.0,
-                Number::__NonExhaustive(_) => {
+                _ => {
                     return Err(ConfigError::type_mismatch("number", value));
                 }
             };
@@ -363,6 +398,44 @@ impl From<Value> for f64 {
     fn from(value: Value) -> Self {
         if let Value(RonValue::Number(num)) = value {
             num.into_f64()
+        } else {
+            panic!("Expected a Number variant but got {value:?}")
+        }
+    }
+}
+
+//Basically just a copy of the From<Value> for f64.
+impl TryFrom<&Value> for f32 {
+    type Error = ConfigError;
+
+    fn try_from(value: &Value) -> Result<Self, Self::Error> {
+        if let Value(RonValue::Number(num)) = value {
+            let number = match num {
+                Number::I8(n) => *n as f32,
+                Number::I16(n) => *n as f32,
+                Number::I32(n) => *n as f32,
+                Number::I64(n) => *n as f32,
+                Number::U8(n) => *n as f32,
+                Number::U16(n) => *n as f32,
+                Number::U32(n) => *n as f32,
+                Number::U64(n) => *n as f32,
+                Number::F32(n) => n.0,
+                Number::F64(n) => n.0 as f32,
+                _ => {
+                    return Err(ConfigError::type_mismatch("number", value));
+                }
+            };
+            Ok(number)
+        } else {
+            Err(ConfigError::type_mismatch("number", value))
+        }
+    }
+}
+
+impl From<Value> for f32 {
+    fn from(value: Value) -> Self {
+        if let Value(RonValue::Number(num)) = value {
+            num.into_f64() as f32
         } else {
             panic!("Expected a Number variant but got {value:?}")
         }
@@ -432,7 +505,47 @@ impl Display for Value {
 /// Configuration for logging in the node.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NodeLogging {
+    #[serde(default = "default_as_true")]
     enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codec: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    codecs: HashMap<String, String>,
+}
+
+impl NodeLogging {
+    #[allow(dead_code)]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[allow(dead_code)]
+    pub fn codec(&self) -> Option<&str> {
+        self.codec.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn codecs(&self) -> &HashMap<String, String> {
+        &self.codecs
+    }
+
+    #[allow(dead_code)]
+    pub fn codec_for_msg_type(&self, msg_type: &str) -> Option<&str> {
+        self.codecs
+            .get(msg_type)
+            .map(String::as_str)
+            .or(self.codec.as_deref())
+    }
+}
+
+impl Default for NodeLogging {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            codec: None,
+            codecs: HashMap::new(),
+        }
+    }
 }
 
 /// Distinguishes regular tasks from bridge nodes so downstream stages can apply
@@ -442,6 +555,31 @@ pub enum Flavor {
     #[default]
     Task,
     Bridge,
+}
+
+/// Declares which Copper task trait a task node implements.
+///
+/// This lets config express the runtime role explicitly instead of forcing the
+/// proc-macro to guess from graph shape alone.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TaskKind {
+    #[serde(rename = "source", alias = "src")]
+    Source,
+    #[serde(rename = "task", alias = "regular", alias = "cutask")]
+    Regular,
+    #[serde(rename = "sink", alias = "snk")]
+    Sink,
+}
+
+impl TaskKind {
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskKind::Source => "source",
+            TaskKind::Regular => "task",
+            TaskKind::Sink => "sink",
+        }
+    }
 }
 
 /// A node in the configuration graph.
@@ -454,6 +592,11 @@ pub struct Node {
     /// Task rust struct underlying type, e.g. "mymodule::Sensor", etc.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     type_: Option<String>,
+
+    /// Declared Copper task role. When omitted, legacy configs still infer it
+    /// from graph shape when that is unambiguous.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<TaskKind>,
 
     /// Config passed to the task.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,6 +643,7 @@ impl Node {
         Node {
             id: id.to_string(),
             type_: Some(ptype.to_string()),
+            kind: None,
             config: None,
             resources: None,
             missions: None,
@@ -536,6 +680,16 @@ impl Node {
     }
 
     #[allow(dead_code)]
+    pub fn get_declared_task_kind(&self) -> Option<TaskKind> {
+        self.kind
+    }
+
+    #[allow(dead_code)]
+    pub fn set_task_kind(&mut self, kind: Option<TaskKind>) {
+        self.kind = kind;
+    }
+
+    #[allow(dead_code)]
     pub fn set_resources<I>(&mut self, resources: Option<I>)
     where
         I: IntoIterator<Item = (String, String)>,
@@ -568,10 +722,15 @@ impl Node {
     #[allow(dead_code)]
     pub fn is_logging_enabled(&self) -> bool {
         if let Some(logging) = &self.logging {
-            logging.enabled
+            logging.enabled()
         } else {
             true
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_logging(&self) -> Option<&NodeLogging> {
+        self.logging.as_ref()
     }
 
     #[allow(dead_code)]
@@ -1127,27 +1286,60 @@ impl CuGraph {
 
     #[allow(dead_code)]
     pub fn get_node_output_msg_type(&self, node_id: &str) -> Option<String> {
-        self.0.node_indices().find_map(|node_index| {
-            if let Some(node) = self.0.node_weight(node_index) {
-                if node.id != node_id {
-                    return None;
+        self.get_node_output_msg_types(node_id)
+            .and_then(|mut msgs| msgs.drain(..1).next())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_node_output_msg_types(&self, node_id: &str) -> Option<Vec<String>> {
+        let node_id = self.get_node_id_by_name(node_id)?;
+        let msgs = self.get_node_output_msg_types_by_id(node_id).ok()?;
+        (!msgs.is_empty()).then_some(msgs)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_node_output_msg_types_by_id(&self, node_id: NodeId) -> CuResult<Vec<String>> {
+        let mut edge_ids = self.get_src_edges(node_id)?;
+        edge_ids.sort();
+
+        let node = self
+            .get_node(node_id)
+            .ok_or_else(|| CuError::from(format!("Node id {node_id} not found")))?;
+
+        let mut msg_order: Vec<(usize, String)> = Vec::new();
+        let mut record_msg = |msg: String, order: usize| {
+            if let Some((existing_order, _)) = msg_order
+                .iter_mut()
+                .find(|(_, existing_msg)| *existing_msg == msg)
+            {
+                if order < *existing_order {
+                    *existing_order = order;
                 }
-                let edges: Vec<_> = self
-                    .0
-                    .edges_directed(node_index, Outgoing)
-                    .map(|edge| edge.id().index())
-                    .collect();
-                if edges.is_empty() {
-                    return None;
-                }
-                let cnx = self
-                    .0
-                    .edge_weight(EdgeIndex::new(edges[0]))
-                    .expect("Found an cnx id but could not retrieve it back");
-                return Some(cnx.msg.clone());
+                return;
             }
-            None
-        })
+            msg_order.push((order, msg));
+        };
+
+        for edge_id in edge_ids {
+            let Some(edge) = self.edge(edge_id) else {
+                continue;
+            };
+            let order = if edge.order == usize::MAX {
+                edge_id
+            } else {
+                edge.order
+            };
+            record_msg(edge.msg.clone(), order);
+        }
+
+        for (msg, order) in node.nc_outputs_with_order() {
+            record_msg(msg.clone(), order);
+        }
+
+        msg_order.sort_by(|(order_a, msg_a), (order_b, msg_b)| {
+            order_a.cmp(order_b).then_with(|| msg_a.cmp(msg_b))
+        });
+        Ok(msg_order.into_iter().map(|(_, msg)| msg).collect())
     }
 
     #[allow(dead_code)]
@@ -1170,6 +1362,8 @@ impl CuGraph {
                 if edges.is_empty() {
                     return None;
                 }
+                let mut edges = edges;
+                edges.sort();
                 let msgs = edges
                     .into_iter()
                     .map(|edge_id| {
@@ -1231,6 +1425,86 @@ impl CuGraph {
     pub fn connect(&mut self, source: NodeId, target: NodeId, msg_type: &str) -> CuResult<()> {
         self.connect_ext(source, target, msg_type, None, None, None)
     }
+}
+
+fn validate_task_kind(
+    node_id: &str,
+    kind: TaskKind,
+    has_inputs: bool,
+    has_outputs: bool,
+) -> CuResult<()> {
+    match kind {
+        TaskKind::Source if has_inputs => Err(CuError::from(format!(
+            "Task '{node_id}' is declared as kind 'source' but has incoming connections. Sources map to CuSrcTask and cannot consume inputs. Use kind: task instead."
+        ))),
+        TaskKind::Regular if !has_inputs => Err(CuError::from(format!(
+            "Task '{node_id}' is declared as kind 'task' but has no incoming connections. Regular tasks map to CuTask and need at least one input connection. Use kind: source if it is input-free."
+        ))),
+        TaskKind::Sink if has_outputs => Err(CuError::from(format!(
+            "Task '{node_id}' is declared as kind 'sink' but has outgoing or NC outputs. Sinks map to CuSinkTask and cannot produce outputs. Use kind: task instead."
+        ))),
+        TaskKind::Sink if !has_inputs => Err(CuError::from(format!(
+            "Task '{node_id}' is declared as kind 'sink' but has no incoming connections. Sinks need at least one input connection so Copper can determine their input message type."
+        ))),
+        _ => Ok(()),
+    }
+}
+
+#[allow(dead_code)]
+pub fn infer_task_kind_for_id(graph: &CuGraph, node_id: NodeId) -> Option<TaskKind> {
+    let node = graph.get_node(node_id)?;
+    if node.get_flavor() != Flavor::Task {
+        return None;
+    }
+
+    let has_inputs = !graph.get_dst_edges(node_id).ok()?.is_empty();
+    let has_outputs = !graph
+        .get_node_output_msg_types_by_id(node_id)
+        .ok()?
+        .is_empty();
+
+    match (has_inputs, has_outputs) {
+        (false, true) => Some(TaskKind::Source),
+        (true, true) => Some(TaskKind::Regular),
+        (true, false) => Some(TaskKind::Sink),
+        (false, false) => None,
+    }
+}
+
+#[allow(dead_code)]
+pub fn resolve_task_kind_for_id(graph: &CuGraph, node_id: NodeId) -> CuResult<TaskKind> {
+    let node = graph
+        .get_node(node_id)
+        .ok_or_else(|| CuError::from(format!("Task node id {node_id} not found")))?;
+    if node.get_flavor() != Flavor::Task {
+        return Err(CuError::from(format!(
+            "Node '{}' is not a task and does not have a task kind.",
+            node.id
+        )));
+    }
+
+    let has_inputs = !graph.get_dst_edges(node_id)?.is_empty();
+    let has_outputs = !graph.get_node_output_msg_types_by_id(node_id)?.is_empty();
+
+    if let Some(kind) = node.get_declared_task_kind() {
+        validate_task_kind(node.id.as_str(), kind, has_inputs, has_outputs)?;
+        return Ok(kind);
+    }
+
+    let inferred = match (has_inputs, has_outputs) {
+        (false, true) => TaskKind::Source,
+        (true, true) => TaskKind::Regular,
+        (true, false) => TaskKind::Sink,
+        (false, false) => {
+            return Err(CuError::from(format!(
+                "Task '{}' has no declared inputs or outputs, so Copper cannot infer whether it is a source, task, or sink. Add `kind: source|task|sink`; source/task nodes also need an output declaration via a connection or `dst: \"{NC_ENDPOINT}\"`.",
+                node.id
+            )));
+        }
+    };
+
+    validate_task_kind(node.id.as_str(), inferred, has_inputs, has_outputs)?;
+    Ok(inferred)
 }
 
 impl core::ops::Index<NodeIndex> for CuGraph {
@@ -1411,11 +1685,18 @@ fn default_keyframe_interval() -> Option<u32> {
     Some(DEFAULT_KEYFRAME_INTERVAL)
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LoggingConfig {
     /// Enable task logging to the log file.
     #[serde(default = "default_as_true", skip_serializing_if = "Clone::clone")]
     pub enable_task_logging: bool,
+
+    /// Number of preallocated CopperLists available to the runtime.
+    ///
+    /// This is consumed by proc-macro codegen and must match the value compiled into the
+    /// application binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copperlist_count: Option<usize>,
 
     /// Size of each slab in the log file. (it is the size of the memory mapped file at a time)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1431,6 +1712,32 @@ pub struct LoggingConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub keyframe_interval: Option<u32>,
+
+    /// Named log codec specs reusable across task output bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<LoggingCodecSpec>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enable_task_logging: true,
+            copperlist_count: None,
+            slab_size_mib: None,
+            section_size_mib: None,
+            keyframe_interval: default_keyframe_interval(),
+            codecs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LoggingCodecSpec {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ComponentConfig>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -1444,6 +1751,12 @@ pub struct RuntimeConfig {
     pub rate_target_hz: Option<u64>,
 }
 
+/// Maximum representable Copper runtime rate target in whole Hertz.
+///
+/// Copper stores runtime periods in integer nanoseconds, so anything above 1 GHz
+/// would round down to a zero-duration period.
+pub const MAX_RATE_TARGET_HZ: u64 = 1_000_000_000;
+
 /// Missions are used to generate alternative DAGs within the same configuration.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MissionsConfig {
@@ -1456,6 +1769,165 @@ pub struct IncludesConfig {
     pub path: String,
     pub params: HashMap<String, Value>,
     pub missions: Option<Vec<String>>,
+}
+
+/// One subsystem participating in a multi-Copper deployment.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MultiCopperSubsystemConfig {
+    pub id: String,
+    pub config: String,
+}
+
+/// One explicit interconnect between two subsystem bridge channels.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MultiCopperInterconnectConfig {
+    pub from: String,
+    pub to: String,
+    pub msg: String,
+}
+
+/// One path-based config overlay applied to a parsed local Copper config.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InstanceConfigSetOperation {
+    pub path: String,
+    pub value: ComponentConfig,
+}
+
+/// Typed endpoint reference used by validated multi-Copper interconnects.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MultiCopperEndpoint {
+    pub subsystem_id: String,
+    pub bridge_id: String,
+    pub channel_id: String,
+}
+
+#[cfg(feature = "std")]
+impl Display for MultiCopperEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}",
+            self.subsystem_id, self.bridge_id, self.channel_id
+        )
+    }
+}
+
+/// Validated subsystem entry with its compiler-assigned numeric subsystem code and parsed local Copper config.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct MultiCopperSubsystem {
+    pub id: String,
+    pub subsystem_code: u16,
+    pub config_path: String,
+    pub config: CuConfig,
+}
+
+/// Validated explicit interconnect between two subsystem endpoints.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiCopperInterconnect {
+    pub from: MultiCopperEndpoint,
+    pub to: MultiCopperEndpoint,
+    pub msg: String,
+    pub bridge_type: String,
+}
+
+/// Strict umbrella configuration describing multiple Copper subsystems and their explicit links.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct MultiCopperConfig {
+    pub subsystems: Vec<MultiCopperSubsystem>,
+    pub interconnects: Vec<MultiCopperInterconnect>,
+    pub instance_overrides_root: Option<String>,
+}
+
+#[cfg(feature = "std")]
+impl MultiCopperConfig {
+    #[allow(dead_code)]
+    pub fn subsystem(&self, id: &str) -> Option<&MultiCopperSubsystem> {
+        self.subsystems.iter().find(|subsystem| subsystem.id == id)
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_subsystem_config_for_instance(
+        &self,
+        subsystem_id: &str,
+        instance_id: u32,
+    ) -> CuResult<CuConfig> {
+        let subsystem = self.subsystem(subsystem_id).ok_or_else(|| {
+            CuError::from(format!(
+                "Multi-Copper config does not define subsystem '{}'.",
+                subsystem_id
+            ))
+        })?;
+        let mut config = subsystem.config.clone();
+
+        let Some(root) = &self.instance_overrides_root else {
+            return Ok(config);
+        };
+
+        let override_path = std::path::Path::new(root)
+            .join(instance_id.to_string())
+            .join(format!("{subsystem_id}.ron"));
+        if !override_path.exists() {
+            return Ok(config);
+        }
+
+        apply_instance_overrides_from_file(&mut config, &override_path)?;
+        Ok(config)
+    }
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct MultiCopperConfigRepresentation {
+    subsystems: Vec<MultiCopperSubsystemConfig>,
+    interconnects: Vec<MultiCopperInterconnectConfig>,
+    instance_overrides_root: Option<String>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct InstanceConfigOverridesRepresentation {
+    #[serde(default)]
+    set: Vec<InstanceConfigSetOperation>,
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiCopperChannelDirection {
+    Rx,
+    Tx,
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct MultiCopperChannelContract {
+    bridge_type: String,
+    direction: MultiCopperChannelDirection,
+    msg: Option<String>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceConfigTargetKind {
+    Task,
+    Resource,
+    Bridge,
 }
 
 /// This is the main Copper configuration representation.
@@ -2057,11 +2529,39 @@ impl CuConfig {
         self.runtime.as_ref()
     }
 
+    #[allow(dead_code)]
+    pub fn find_task_node(&self, mission_id: Option<&str>, task_id: &str) -> Option<&Node> {
+        self.get_graph(mission_id)
+            .ok()?
+            .get_all_nodes()
+            .into_iter()
+            .find_map(|(_, node)| {
+                (node.get_flavor() == Flavor::Task && node.id == task_id).then_some(node)
+            })
+    }
+
+    #[allow(dead_code)]
+    pub fn find_logging_codec_spec(&self, codec_id: &str) -> Option<&LoggingCodecSpec> {
+        self.logging
+            .as_ref()?
+            .codecs
+            .iter()
+            .find(|spec| spec.id == codec_id)
+    }
+
     /// Validate the logging configuration to ensure section pre-allocation sizes do not exceed slab sizes.
     /// This method is wrapper around [LoggingConfig::validate]
     pub fn validate_logging_config(&self) -> CuResult<()> {
         if let Some(logging) = &self.logging {
             return logging.validate();
+        }
+        Ok(())
+    }
+
+    /// Validate the runtime configuration.
+    pub fn validate_runtime_config(&self) -> CuResult<()> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.validate();
         }
         Ok(())
     }
@@ -2176,14 +2676,13 @@ impl CuConfig {
                 .get_node(node_idx)
                 .ok_or_else(|| CuError::from(format!("Node '{}' missing weight", node.id)))?;
 
-            let is_src = graph.get_dst_edges(node_idx).unwrap_or_default().is_empty();
-            let is_sink = graph.get_src_edges(node_idx).unwrap_or_default().is_empty();
-
             let fillcolor = match node.flavor {
                 Flavor::Bridge => "#faedcd",
-                Flavor::Task if is_src => "#ddefc7",
-                Flavor::Task if is_sink => "#cce0ff",
-                _ => "#f2f2f2",
+                Flavor::Task => match resolve_task_kind_for_id(graph, node_idx)? {
+                    TaskKind::Source => "#ddefc7",
+                    TaskKind::Sink => "#cce0ff",
+                    TaskKind::Regular => "#f2f2f2",
+                },
             };
 
             let port_base = format!("{}{}", node_prefix, sanitize_identifier(&node.id));
@@ -2286,7 +2785,7 @@ pub(crate) fn build_render_topology(graph: &CuGraph, bridges: &[BridgeConfig]) -
 
     let mut nodes: Vec<RenderNode> = Vec::new();
     let mut node_lookup: HashMap<String, usize> = HashMap::new();
-    for (_, node) in graph.get_all_nodes() {
+    for (node_idx, node) in graph.get_all_nodes() {
         let node_id = node.get_id();
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
@@ -2301,6 +2800,15 @@ pub(crate) fn build_render_topology(graph: &CuGraph, bridges: &[BridgeConfig]) -
                     BridgeChannelConfigRepresentation::Tx { id, .. } => inputs.push(id.clone()),
                 }
             }
+        } else if node.get_flavor() == Flavor::Task {
+            for (idx, msg) in graph
+                .get_node_output_msg_types_by_id(node_idx)
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                outputs.push(format!("out{idx}: {msg}"));
+            }
         }
 
         node_lookup.insert(node_id.clone(), nodes.len());
@@ -2314,20 +2822,20 @@ pub(crate) fn build_render_topology(graph: &CuGraph, bridges: &[BridgeConfig]) -
     }
 
     let mut output_port_lookup: Vec<HashMap<String, String>> = vec![HashMap::new(); nodes.len()];
-    let mut output_edges: Vec<_> = graph.0.edge_references().collect();
-    output_edges.sort_by_key(|edge| edge.id().index());
-    for edge in output_edges {
-        let cnx = edge.weight();
-        if let Some(&idx) = node_lookup.get(&cnx.src)
-            && nodes[idx].flavor == Flavor::Task
-            && cnx.src_channel.is_none()
+    for (node_idx, node) in graph.get_all_nodes() {
+        let Some(&idx) = node_lookup.get(&node.get_id()) else {
+            continue;
+        };
+        if node.get_flavor() != Flavor::Task {
+            continue;
+        }
+        for (port_idx, msg) in graph
+            .get_node_output_msg_types_by_id(node_idx)
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
         {
-            let port_map = &mut output_port_lookup[idx];
-            if !port_map.contains_key(&cnx.msg) {
-                let label = format!("out{}: {}", port_map.len(), cnx.msg);
-                port_map.insert(cnx.msg.clone(), label.clone());
-                nodes[idx].outputs.push(label);
-            }
+            output_port_lookup[idx].insert(msg.clone(), format!("out{port_idx}: {msg}"));
         }
     }
 
@@ -2508,6 +3016,14 @@ fn escape_dot_id(value: &str) -> String {
 impl LoggingConfig {
     /// Validate the logging configuration to ensure section pre-allocation sizes do not exceed slab sizes.
     pub fn validate(&self) -> CuResult<()> {
+        if let Some(copperlist_count) = self.copperlist_count
+            && copperlist_count == 0
+        {
+            return Err(CuError::from(
+                "CopperList count cannot be zero. Set logging.copperlist_count to at least 1.",
+            ));
+        }
+
         if let Some(section_size_mib) = self.section_size_mib
             && let Some(slab_size_mib) = self.slab_size_mib
             && section_size_mib > slab_size_mib
@@ -2515,6 +3031,37 @@ impl LoggingConfig {
             return Err(CuError::from(format!(
                 "Section size ({section_size_mib} MiB) cannot be larger than slab size ({slab_size_mib} MiB). Adjust the parameters accordingly."
             )));
+        }
+
+        let mut codec_ids = HashMap::new();
+        for codec in &self.codecs {
+            if codec_ids.insert(codec.id.as_str(), ()).is_some() {
+                return Err(CuError::from(format!(
+                    "Duplicate logging codec id '{}'. Codec ids must be unique.",
+                    codec.id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl RuntimeConfig {
+    /// Validate runtime loop-rate settings.
+    pub fn validate(&self) -> CuResult<()> {
+        if let Some(rate_target_hz) = self.rate_target_hz {
+            if rate_target_hz == 0 {
+                return Err(CuError::from(
+                    "Runtime rate target cannot be zero. Set runtime.rate_target_hz to at least 1.",
+                ));
+            }
+
+            if rate_target_hz > MAX_RATE_TARGET_HZ {
+                return Err(CuError::from(format!(
+                    "Runtime rate target ({rate_target_hz} Hz) exceeds the supported maximum of {MAX_RATE_TARGET_HZ} Hz."
+                )));
+            }
         }
 
         Ok(())
@@ -2550,13 +3097,14 @@ fn process_includes(
             let include_path = if include.path.starts_with('/') {
                 include.path.clone()
             } else {
-                let current_dir = std::path::Path::new(file_path)
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new(""))
-                    .to_string_lossy()
-                    .to_string();
+                let current_dir = std::path::Path::new(file_path).parent();
 
-                format!("{}/{}", current_dir, include.path)
+                match current_dir.map(|path| path.to_string_lossy().to_string()) {
+                    Some(current_dir) if !current_dir.is_empty() => {
+                        format!("{}/{}", current_dir, include.path)
+                    }
+                    _ => include.path,
+                }
             };
 
             let include_content = read_to_string(&include_path).map_err(|e| {
@@ -2632,10 +3180,16 @@ fn process_includes(
                 } else {
                     let mut cnx = result.cnx.take().unwrap();
                     for included_c in included_cnx {
-                        if !cnx
-                            .iter()
-                            .any(|c| c.src == included_c.src && c.dst == included_c.dst)
-                        {
+                        if let Some(existing_cnx) = cnx.iter_mut().find(|c| {
+                            c.src == included_c.src
+                                && c.dst == included_c.dst
+                                && c.msg == included_c.msg
+                        }) {
+                            merge_connection_missions(
+                                &mut existing_cnx.missions,
+                                &included_c.missions,
+                            );
+                        } else {
                             cnx.push(included_c);
                         }
                     }
@@ -2684,6 +3238,577 @@ fn process_includes(
     Ok(result)
 }
 
+#[cfg(feature = "std")]
+fn parse_instance_config_overrides_string(
+    content: &str,
+) -> CuResult<InstanceConfigOverridesRepresentation> {
+    Options::default()
+        .with_default_extension(Extensions::IMPLICIT_SOME)
+        .with_default_extension(Extensions::UNWRAP_NEWTYPES)
+        .with_default_extension(Extensions::UNWRAP_VARIANT_NEWTYPES)
+        .from_str(content)
+        .map_err(|e| {
+            CuError::from(format!(
+                "Failed to parse instance override file: Error: {} at position {}",
+                e.code, e.span
+            ))
+        })
+}
+
+#[cfg(feature = "std")]
+fn merge_component_config(target: &mut Option<ComponentConfig>, value: &ComponentConfig) {
+    if let Some(existing) = target {
+        existing.merge_from(value);
+    } else {
+        *target = Some(value.clone());
+    }
+}
+
+#[cfg(feature = "std")]
+fn apply_task_config_override_to_graph(
+    graph: &mut CuGraph,
+    task_id: &str,
+    value: &ComponentConfig,
+) -> usize {
+    let mut matches = 0usize;
+    let node_indices: Vec<_> = graph.0.node_indices().collect();
+    for node_index in node_indices {
+        let node = &mut graph.0[node_index];
+        if node.get_flavor() == Flavor::Task && node.id == task_id {
+            merge_component_config(&mut node.config, value);
+            matches += 1;
+        }
+    }
+    matches
+}
+
+#[cfg(feature = "std")]
+fn apply_bridge_node_config_override_to_graph(
+    graph: &mut CuGraph,
+    bridge_id: &str,
+    value: &ComponentConfig,
+) {
+    let node_indices: Vec<_> = graph.0.node_indices().collect();
+    for node_index in node_indices {
+        let node = &mut graph.0[node_index];
+        if node.get_flavor() == Flavor::Bridge && node.id == bridge_id {
+            merge_component_config(&mut node.config, value);
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn parse_instance_override_target(path: &str) -> CuResult<(InstanceConfigTargetKind, String)> {
+    let mut parts = path.split('/');
+    let scope = parts.next().unwrap_or_default();
+    let id = parts.next().unwrap_or_default();
+    let leaf = parts.next().unwrap_or_default();
+
+    if scope.is_empty() || id.is_empty() || leaf.is_empty() || parts.next().is_some() {
+        return Err(CuError::from(format!(
+            "Invalid instance override path '{}'. Expected 'tasks/<id>/config', 'resources/<id>/config', or 'bridges/<id>/config'.",
+            path
+        )));
+    }
+
+    if leaf != "config" {
+        return Err(CuError::from(format!(
+            "Invalid instance override path '{}'. Only the '/config' leaf is supported.",
+            path
+        )));
+    }
+
+    let kind = match scope {
+        "tasks" => InstanceConfigTargetKind::Task,
+        "resources" => InstanceConfigTargetKind::Resource,
+        "bridges" => InstanceConfigTargetKind::Bridge,
+        _ => {
+            return Err(CuError::from(format!(
+                "Invalid instance override path '{}'. Supported roots are 'tasks', 'resources', and 'bridges'.",
+                path
+            )));
+        }
+    };
+
+    Ok((kind, id.to_string()))
+}
+
+#[cfg(feature = "std")]
+fn apply_instance_config_set_operation(
+    config: &mut CuConfig,
+    operation: &InstanceConfigSetOperation,
+) -> CuResult<()> {
+    let (target_kind, target_id) = parse_instance_override_target(&operation.path)?;
+
+    match target_kind {
+        InstanceConfigTargetKind::Task => {
+            let matches = match &mut config.graphs {
+                ConfigGraphs::Simple(graph) => {
+                    apply_task_config_override_to_graph(graph, &target_id, &operation.value)
+                }
+                ConfigGraphs::Missions(graphs) => graphs
+                    .values_mut()
+                    .map(|graph| {
+                        apply_task_config_override_to_graph(graph, &target_id, &operation.value)
+                    })
+                    .sum(),
+            };
+
+            if matches == 0 {
+                return Err(CuError::from(format!(
+                    "Instance override path '{}' targets unknown task '{}'.",
+                    operation.path, target_id
+                )));
+            }
+        }
+        InstanceConfigTargetKind::Resource => {
+            let mut matches = 0usize;
+            for resource in &mut config.resources {
+                if resource.id == target_id {
+                    merge_component_config(&mut resource.config, &operation.value);
+                    matches += 1;
+                }
+            }
+            if matches == 0 {
+                return Err(CuError::from(format!(
+                    "Instance override path '{}' targets unknown resource '{}'.",
+                    operation.path, target_id
+                )));
+            }
+        }
+        InstanceConfigTargetKind::Bridge => {
+            let mut matches = 0usize;
+            for bridge in &mut config.bridges {
+                if bridge.id == target_id {
+                    merge_component_config(&mut bridge.config, &operation.value);
+                    matches += 1;
+                }
+            }
+            if matches == 0 {
+                return Err(CuError::from(format!(
+                    "Instance override path '{}' targets unknown bridge '{}'.",
+                    operation.path, target_id
+                )));
+            }
+
+            match &mut config.graphs {
+                ConfigGraphs::Simple(graph) => {
+                    apply_bridge_node_config_override_to_graph(graph, &target_id, &operation.value);
+                }
+                ConfigGraphs::Missions(graphs) => {
+                    for graph in graphs.values_mut() {
+                        apply_bridge_node_config_override_to_graph(
+                            graph,
+                            &target_id,
+                            &operation.value,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+fn apply_instance_overrides(
+    config: &mut CuConfig,
+    overrides: &InstanceConfigOverridesRepresentation,
+) -> CuResult<()> {
+    for operation in &overrides.set {
+        apply_instance_config_set_operation(config, operation)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+fn apply_instance_overrides_from_file(
+    config: &mut CuConfig,
+    override_path: &std::path::Path,
+) -> CuResult<()> {
+    let override_content = read_to_string(override_path).map_err(|e| {
+        CuError::from(format!(
+            "Failed to read instance override file '{}'",
+            override_path.display()
+        ))
+        .add_cause(e.to_string().as_str())
+    })?;
+    let overrides = parse_instance_config_overrides_string(&override_content).map_err(|e| {
+        CuError::from(format!(
+            "Failed to parse instance override file '{}': {e}",
+            override_path.display()
+        ))
+    })?;
+    apply_instance_overrides(config, &overrides)
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn parse_multi_config_string(content: &str) -> CuResult<MultiCopperConfigRepresentation> {
+    Options::default()
+        .with_default_extension(Extensions::IMPLICIT_SOME)
+        .with_default_extension(Extensions::UNWRAP_NEWTYPES)
+        .with_default_extension(Extensions::UNWRAP_VARIANT_NEWTYPES)
+        .from_str(content)
+        .map_err(|e| {
+            CuError::from(format!(
+                "Failed to parse multi-Copper configuration: Error: {} at position {}",
+                e.code, e.span
+            ))
+        })
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn resolve_relative_config_path(base_path: Option<&str>, referenced_path: &str) -> String {
+    if referenced_path.starts_with('/') || base_path.is_none() {
+        return referenced_path.to_string();
+    }
+
+    let current_dir = std::path::Path::new(base_path.expect("checked above"))
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .to_path_buf();
+    current_dir
+        .join(referenced_path)
+        .to_string_lossy()
+        .to_string()
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn parse_multi_endpoint(endpoint: &str) -> CuResult<MultiCopperEndpoint> {
+    let mut parts = endpoint.split('/');
+    let subsystem_id = parts.next().unwrap_or_default();
+    let bridge_id = parts.next().unwrap_or_default();
+    let channel_id = parts.next().unwrap_or_default();
+
+    if subsystem_id.is_empty()
+        || bridge_id.is_empty()
+        || channel_id.is_empty()
+        || parts.next().is_some()
+    {
+        return Err(CuError::from(format!(
+            "Invalid multi-Copper endpoint '{endpoint}'. Expected 'subsystem/bridge/channel'."
+        )));
+    }
+
+    Ok(MultiCopperEndpoint {
+        subsystem_id: subsystem_id.to_string(),
+        bridge_id: bridge_id.to_string(),
+        channel_id: channel_id.to_string(),
+    })
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn multi_channel_key(bridge_id: &str, channel_id: &str) -> String {
+    format!("{bridge_id}/{channel_id}")
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn register_multi_channel_msg(
+    contracts: &mut HashMap<String, MultiCopperChannelContract>,
+    bridge_id: &str,
+    channel_id: &str,
+    expected_direction: MultiCopperChannelDirection,
+    msg: &str,
+) -> CuResult<()> {
+    let key = multi_channel_key(bridge_id, channel_id);
+    let contract = contracts.get_mut(&key).ok_or_else(|| {
+        CuError::from(format!(
+            "Bridge channel '{bridge_id}/{channel_id}' is referenced by the graph but not declared in the bridge config."
+        ))
+    })?;
+
+    if contract.direction != expected_direction {
+        let expected = match expected_direction {
+            MultiCopperChannelDirection::Rx => "Rx",
+            MultiCopperChannelDirection::Tx => "Tx",
+        };
+        return Err(CuError::from(format!(
+            "Bridge channel '{bridge_id}/{channel_id}' is used as {expected} in the graph but declared with the opposite direction."
+        )));
+    }
+
+    match &contract.msg {
+        Some(existing) if existing != msg => Err(CuError::from(format!(
+            "Bridge channel '{bridge_id}/{channel_id}' carries inconsistent message types '{existing}' and '{msg}'."
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            contract.msg = Some(msg.to_string());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn build_multi_bridge_channel_contracts(
+    config: &CuConfig,
+) -> CuResult<HashMap<String, MultiCopperChannelContract>> {
+    let graph = config.graphs.get_default_mission_graph().map_err(|e| {
+        CuError::from(format!(
+            "Multi-Copper subsystem configs currently require exactly one local graph: {e}"
+        ))
+    })?;
+
+    let mut contracts = HashMap::new();
+    for bridge in &config.bridges {
+        for channel in &bridge.channels {
+            let (channel_id, direction) = match channel {
+                BridgeChannelConfigRepresentation::Rx { id, .. } => {
+                    (id.as_str(), MultiCopperChannelDirection::Rx)
+                }
+                BridgeChannelConfigRepresentation::Tx { id, .. } => {
+                    (id.as_str(), MultiCopperChannelDirection::Tx)
+                }
+            };
+
+            let key = multi_channel_key(&bridge.id, channel_id);
+            if contracts.contains_key(&key) {
+                return Err(CuError::from(format!(
+                    "Duplicate bridge channel declaration for '{key}'."
+                )));
+            }
+
+            contracts.insert(
+                key,
+                MultiCopperChannelContract {
+                    bridge_type: bridge.type_.clone(),
+                    direction,
+                    msg: None,
+                },
+            );
+        }
+    }
+
+    for edge in graph.edges() {
+        if let Some(channel_id) = &edge.src_channel {
+            register_multi_channel_msg(
+                &mut contracts,
+                &edge.src,
+                channel_id,
+                MultiCopperChannelDirection::Rx,
+                &edge.msg,
+            )?;
+        }
+        if let Some(channel_id) = &edge.dst_channel {
+            register_multi_channel_msg(
+                &mut contracts,
+                &edge.dst,
+                channel_id,
+                MultiCopperChannelDirection::Tx,
+                &edge.msg,
+            )?;
+        }
+    }
+
+    Ok(contracts)
+}
+
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+fn validate_multi_config_representation(
+    representation: MultiCopperConfigRepresentation,
+    file_path: Option<&str>,
+) -> CuResult<MultiCopperConfig> {
+    if representation
+        .instance_overrides_root
+        .as_ref()
+        .is_some_and(|root| root.trim().is_empty())
+    {
+        return Err(CuError::from(
+            "Multi-Copper instance_overrides_root must not be empty.",
+        ));
+    }
+
+    if representation.subsystems.is_empty() {
+        return Err(CuError::from(
+            "Multi-Copper config must declare at least one subsystem.",
+        ));
+    }
+    if representation.subsystems.len() > usize::from(u16::MAX) + 1 {
+        return Err(CuError::from(
+            "Multi-Copper config supports at most 65536 distinct subsystem ids.",
+        ));
+    }
+
+    let mut seen_subsystems = std::collections::HashSet::new();
+    for subsystem in &representation.subsystems {
+        if subsystem.id.trim().is_empty() {
+            return Err(CuError::from(
+                "Multi-Copper subsystem ids must not be empty.",
+            ));
+        }
+        if !seen_subsystems.insert(subsystem.id.clone()) {
+            return Err(CuError::from(format!(
+                "Duplicate multi-Copper subsystem id '{}'.",
+                subsystem.id
+            )));
+        }
+    }
+
+    let mut sorted_ids: Vec<_> = representation
+        .subsystems
+        .iter()
+        .map(|subsystem| subsystem.id.clone())
+        .collect();
+    sorted_ids.sort();
+    let subsystem_code_map: HashMap<_, _> = sorted_ids
+        .into_iter()
+        .enumerate()
+        .map(|(idx, id)| {
+            (
+                id,
+                u16::try_from(idx).expect("subsystem count was validated against u16 range"),
+            )
+        })
+        .collect();
+
+    let mut subsystem_contracts: HashMap<String, HashMap<String, MultiCopperChannelContract>> =
+        HashMap::new();
+    let mut subsystems = Vec::with_capacity(representation.subsystems.len());
+
+    for subsystem in representation.subsystems {
+        let resolved_config_path = resolve_relative_config_path(file_path, &subsystem.config);
+        let config = read_configuration(&resolved_config_path).map_err(|e| {
+            CuError::from(format!(
+                "Failed to read subsystem '{}' from '{}': {e}",
+                subsystem.id, resolved_config_path
+            ))
+        })?;
+        let contracts = build_multi_bridge_channel_contracts(&config).map_err(|e| {
+            CuError::from(format!(
+                "Invalid subsystem '{}' for multi-Copper validation: {e}",
+                subsystem.id
+            ))
+        })?;
+        subsystem_contracts.insert(subsystem.id.clone(), contracts);
+        subsystems.push(MultiCopperSubsystem {
+            subsystem_code: *subsystem_code_map
+                .get(&subsystem.id)
+                .expect("subsystem code map must contain every subsystem"),
+            id: subsystem.id,
+            config_path: resolved_config_path,
+            config,
+        });
+    }
+
+    let mut interconnects = Vec::with_capacity(representation.interconnects.len());
+    for interconnect in representation.interconnects {
+        let from = parse_multi_endpoint(&interconnect.from).map_err(|e| {
+            CuError::from(format!(
+                "Invalid multi-Copper interconnect source '{}': {e}",
+                interconnect.from
+            ))
+        })?;
+        let to = parse_multi_endpoint(&interconnect.to).map_err(|e| {
+            CuError::from(format!(
+                "Invalid multi-Copper interconnect destination '{}': {e}",
+                interconnect.to
+            ))
+        })?;
+
+        let from_contracts = subsystem_contracts.get(&from.subsystem_id).ok_or_else(|| {
+            CuError::from(format!(
+                "Interconnect source '{}' references unknown subsystem '{}'.",
+                from, from.subsystem_id
+            ))
+        })?;
+        let to_contracts = subsystem_contracts.get(&to.subsystem_id).ok_or_else(|| {
+            CuError::from(format!(
+                "Interconnect destination '{}' references unknown subsystem '{}'.",
+                to, to.subsystem_id
+            ))
+        })?;
+
+        let from_contract = from_contracts
+            .get(&multi_channel_key(&from.bridge_id, &from.channel_id))
+            .ok_or_else(|| {
+                CuError::from(format!(
+                    "Interconnect source '{}' references unknown bridge channel.",
+                    from
+                ))
+            })?;
+        let to_contract = to_contracts
+            .get(&multi_channel_key(&to.bridge_id, &to.channel_id))
+            .ok_or_else(|| {
+                CuError::from(format!(
+                    "Interconnect destination '{}' references unknown bridge channel.",
+                    to
+                ))
+            })?;
+
+        if from_contract.direction != MultiCopperChannelDirection::Tx {
+            return Err(CuError::from(format!(
+                "Interconnect source '{}' must reference a Tx bridge channel.",
+                from
+            )));
+        }
+        if to_contract.direction != MultiCopperChannelDirection::Rx {
+            return Err(CuError::from(format!(
+                "Interconnect destination '{}' must reference an Rx bridge channel.",
+                to
+            )));
+        }
+
+        if from_contract.bridge_type != to_contract.bridge_type {
+            return Err(CuError::from(format!(
+                "Interconnect '{}' -> '{}' mixes incompatible bridge types '{}' and '{}'.",
+                from, to, from_contract.bridge_type, to_contract.bridge_type
+            )));
+        }
+
+        let from_msg = from_contract.msg.as_ref().ok_or_else(|| {
+            CuError::from(format!(
+                "Interconnect source '{}' is not wired inside subsystem '{}', so its message type cannot be inferred.",
+                from, from.subsystem_id
+            ))
+        })?;
+        let to_msg = to_contract.msg.as_ref().ok_or_else(|| {
+            CuError::from(format!(
+                "Interconnect destination '{}' is not wired inside subsystem '{}', so its message type cannot be inferred.",
+                to, to.subsystem_id
+            ))
+        })?;
+
+        if from_msg != to_msg {
+            return Err(CuError::from(format!(
+                "Interconnect '{}' -> '{}' connects incompatible message types '{}' and '{}'.",
+                from, to, from_msg, to_msg
+            )));
+        }
+        if interconnect.msg != *from_msg {
+            return Err(CuError::from(format!(
+                "Interconnect '{}' -> '{}' declares message type '{}' but subsystem graphs require '{}'.",
+                from, to, interconnect.msg, from_msg
+            )));
+        }
+
+        interconnects.push(MultiCopperInterconnect {
+            from,
+            to,
+            msg: interconnect.msg,
+            bridge_type: from_contract.bridge_type.clone(),
+        });
+    }
+
+    let instance_overrides_root = representation
+        .instance_overrides_root
+        .as_ref()
+        .map(|root| resolve_relative_config_path(file_path, root));
+
+    Ok(MultiCopperConfig {
+        subsystems,
+        interconnects,
+        instance_overrides_root,
+    })
+}
+
 /// Read a copper configuration from a file.
 #[cfg(feature = "std")]
 pub fn read_configuration(config_filename: &str) -> CuResult<CuConfig> {
@@ -2725,6 +3850,7 @@ fn config_representation_to_config(representation: CuConfigRepresentation) -> Cu
     cuconfig.ensure_threadpool_bundle();
 
     cuconfig.validate_logging_config()?;
+    cuconfig.validate_runtime_config()?;
 
     Ok(cuconfig)
 }
@@ -2750,6 +3876,31 @@ pub fn read_configuration_str(
     config_representation_to_config(representation)
 }
 
+/// Read a strict multi-Copper umbrella configuration from a file.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+pub fn read_multi_configuration(config_filename: &str) -> CuResult<MultiCopperConfig> {
+    let config_content = read_to_string(config_filename).map_err(|e| {
+        CuError::from(format!(
+            "Failed to read multi-Copper configuration file: {:?}",
+            &config_filename
+        ))
+        .add_cause(e.to_string().as_str())
+    })?;
+    read_multi_configuration_str(config_content, Some(config_filename))
+}
+
+/// Read a strict multi-Copper umbrella configuration from a string.
+#[cfg(feature = "std")]
+#[allow(dead_code)]
+pub fn read_multi_configuration_str(
+    config_content: String,
+    file_path: Option<&str>,
+) -> CuResult<MultiCopperConfig> {
+    let representation = parse_multi_config_string(&config_content)?;
+    validate_multi_config_representation(representation, file_path)
+}
+
 // tests
 #[cfg(test)]
 mod tests {
@@ -2757,6 +3908,8 @@ mod tests {
     #[cfg(not(feature = "std"))]
     use alloc::vec;
     use serde::Deserialize;
+    #[cfg(feature = "std")]
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn test_plain_serialize() {
@@ -3648,6 +4801,171 @@ mod tests {
     }
 
     #[test]
+    fn test_task_kind_roundtrip_and_alias() {
+        let txt = r#"(
+            tasks: [
+                (id: "src", type: "a", kind: source),
+                (id: "regular", type: "b", kind: regular),
+                (id: "sink", type: "c", kind: sink),
+            ],
+            cnx: [
+                (src: "src", dst: "regular", msg: "msg::A"),
+                (src: "regular", dst: "sink", msg: "msg::B"),
+            ]
+        )"#;
+
+        let config = CuConfig::deserialize_ron(txt).unwrap();
+        let graph = config.get_graph(None).unwrap();
+
+        assert_eq!(
+            graph
+                .get_node(graph.get_node_id_by_name("src").unwrap())
+                .unwrap()
+                .get_declared_task_kind(),
+            Some(TaskKind::Source)
+        );
+        assert_eq!(
+            graph
+                .get_node(graph.get_node_id_by_name("regular").unwrap())
+                .unwrap()
+                .get_declared_task_kind(),
+            Some(TaskKind::Regular)
+        );
+        assert_eq!(
+            graph
+                .get_node(graph.get_node_id_by_name("sink").unwrap())
+                .unwrap()
+                .get_declared_task_kind(),
+            Some(TaskKind::Sink)
+        );
+
+        let serialized = config.serialize_ron().unwrap();
+        assert!(serialized.contains("kind: source"));
+        assert!(serialized.contains("kind: task"));
+        assert!(serialized.contains("kind: sink"));
+    }
+
+    #[test]
+    fn test_resolve_task_kind_uses_nc_outputs_for_regular_tasks() {
+        let txt = r#"(
+            tasks: [
+                (id: "src", type: "a"),
+                (id: "regular", type: "b"),
+            ],
+            cnx: [
+                (src: "src", dst: "regular", msg: "msg::A"),
+                (src: "regular", dst: "__nc__", msg: "msg::B"),
+            ]
+        )"#;
+
+        let config = CuConfig::deserialize_ron(txt).unwrap();
+        let graph = config.get_graph(None).unwrap();
+        let regular_id = graph.get_node_id_by_name("regular").unwrap();
+
+        assert_eq!(
+            resolve_task_kind_for_id(graph, regular_id).unwrap(),
+            TaskKind::Regular
+        );
+    }
+
+    #[test]
+    fn test_resolve_task_kind_rejects_isolated_task_without_kind() {
+        let txt = r#"(
+            tasks: [
+                (id: "lonely", type: "a"),
+            ],
+            cnx: []
+        )"#;
+
+        let config = CuConfig::deserialize_ron(txt).unwrap();
+        let graph = config.get_graph(None).unwrap();
+        let lonely_id = graph.get_node_id_by_name("lonely").unwrap();
+
+        let err = resolve_task_kind_for_id(graph, lonely_id).expect_err("expected task kind error");
+        assert!(
+            err.to_string()
+                .contains("cannot infer whether it is a source, task, or sink"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_explicit_source_kind_allows_missing_declared_outputs() {
+        let txt = r#"(
+            tasks: [
+                (id: "src", type: "a", kind: source),
+            ],
+            cnx: []
+        )"#;
+
+        let config = CuConfig::deserialize_ron(txt).unwrap();
+        let graph = config.get_graph(None).unwrap();
+        let src_id = graph.get_node_id_by_name("src").unwrap();
+
+        assert_eq!(
+            resolve_task_kind_for_id(graph, src_id).unwrap(),
+            TaskKind::Source
+        );
+    }
+
+    #[test]
+    fn test_resolve_explicit_regular_kind_allows_missing_declared_outputs() {
+        let txt = r#"(
+            tasks: [
+                (id: "src", type: "a"),
+                (id: "regular", type: "b", kind: task),
+            ],
+            cnx: [
+                (src: "src", dst: "regular", msg: "msg::A"),
+            ]
+        )"#;
+
+        let config = CuConfig::deserialize_ron(txt).unwrap();
+        let graph = config.get_graph(None).unwrap();
+        let regular_id = graph.get_node_id_by_name("regular").unwrap();
+
+        assert_eq!(
+            resolve_task_kind_for_id(graph, regular_id).unwrap(),
+            TaskKind::Regular
+        );
+    }
+
+    #[test]
+    fn test_runtime_rate_target_rejects_zero() {
+        let txt = r#"(
+            tasks: [(id: "src", type: "a"), (id: "sink", type: "b")],
+            cnx: [(src: "src", dst: "sink", msg: "msg::A")],
+            runtime: (rate_target_hz: 0)
+        )"#;
+
+        let err =
+            read_configuration_str(txt.to_string(), None).expect_err("runtime config should fail");
+        assert!(
+            err.to_string()
+                .contains("Runtime rate target cannot be zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_runtime_rate_target_rejects_above_nanosecond_resolution() {
+        let txt = format!(
+            r#"(
+                tasks: [(id: "src", type: "a"), (id: "sink", type: "b")],
+                cnx: [(src: "src", dst: "sink", msg: "msg::A")],
+                runtime: (rate_target_hz: {})
+            )"#,
+            MAX_RATE_TARGET_HZ + 1
+        );
+
+        let err = read_configuration_str(txt, None).expect_err("runtime config should fail");
+        assert!(
+            err.to_string().contains("exceeds the supported maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_nc_connection_marks_source_output_without_creating_edge() {
         let txt = r#"(
             tasks: [(id: "src", type: "a"), (id: "sink", type: "b")],
@@ -3709,6 +5027,369 @@ mod tests {
                 .map(|(msg, order)| (msg.as_str(), order))
                 .collect::<Vec<_>>(),
             vec![("msg::A", 0)]
+        );
+    }
+
+    #[cfg(feature = "std")]
+    fn multi_config_test_dir(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cu29_multi_config_{name}_{unique}"));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
+    }
+
+    #[cfg(feature = "std")]
+    fn write_multi_config_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("write temp config file");
+        path
+    }
+
+    #[cfg(feature = "std")]
+    fn alpha_subsystem_config() -> &'static str {
+        r#"(
+            tasks: [
+                (id: "src", type: "demo::Src"),
+                (id: "sink", type: "demo::Sink"),
+            ],
+            bridges: [
+                (
+                    id: "zenoh",
+                    type: "demo::ZenohBridge",
+                    channels: [
+                        Tx(id: "ping"),
+                        Rx(id: "pong"),
+                    ],
+                ),
+            ],
+            cnx: [
+                (src: "src", dst: "zenoh/ping", msg: "demo::Ping"),
+                (src: "zenoh/pong", dst: "sink", msg: "demo::Pong"),
+            ],
+        )"#
+    }
+
+    #[cfg(feature = "std")]
+    fn beta_subsystem_config() -> &'static str {
+        r#"(
+            tasks: [
+                (id: "responder", type: "demo::Responder"),
+            ],
+            bridges: [
+                (
+                    id: "zenoh",
+                    type: "demo::ZenohBridge",
+                    channels: [
+                        Rx(id: "ping"),
+                        Tx(id: "pong"),
+                    ],
+                ),
+            ],
+            cnx: [
+                (src: "zenoh/ping", dst: "responder", msg: "demo::Ping"),
+                (src: "responder", dst: "zenoh/pong", msg: "demo::Pong"),
+            ],
+        )"#
+    }
+
+    #[cfg(feature = "std")]
+    fn instance_override_subsystem_config() -> &'static str {
+        r#"(
+            tasks: [
+                (
+                    id: "imu",
+                    type: "demo::ImuTask",
+                    config: {
+                        "sample_hz": 200,
+                    },
+                ),
+            ],
+            resources: [
+                (
+                    id: "board",
+                    provider: "demo::BoardBundle",
+                    config: {
+                        "bus": "i2c-1",
+                    },
+                ),
+            ],
+            bridges: [
+                (
+                    id: "radio",
+                    type: "demo::RadioBridge",
+                    config: {
+                        "mtu": 32,
+                    },
+                    channels: [
+                        Tx(id: "tx"),
+                        Rx(id: "rx"),
+                    ],
+                ),
+            ],
+            cnx: [
+                (src: "imu", dst: "radio/tx", msg: "demo::Packet"),
+                (src: "radio/rx", dst: "imu", msg: "demo::Packet"),
+            ],
+        )"#
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_read_multi_configuration_assigns_stable_subsystem_codes() {
+        let dir = multi_config_test_dir("stable_ids");
+        write_multi_config_file(&dir, "alpha.ron", alpha_subsystem_config());
+        write_multi_config_file(&dir, "beta.ron", beta_subsystem_config());
+        let network_path = write_multi_config_file(
+            &dir,
+            "network.ron",
+            r#"(
+                subsystems: [
+                    (id: "beta", config: "beta.ron"),
+                    (id: "alpha", config: "alpha.ron"),
+                ],
+                interconnects: [
+                    (from: "alpha/zenoh/ping", to: "beta/zenoh/ping", msg: "demo::Ping"),
+                    (from: "beta/zenoh/pong", to: "alpha/zenoh/pong", msg: "demo::Pong"),
+                ],
+            )"#,
+        );
+
+        let config =
+            read_multi_configuration(network_path.to_str().expect("network path utf8")).unwrap();
+
+        let alpha = config.subsystem("alpha").expect("alpha subsystem missing");
+        let beta = config.subsystem("beta").expect("beta subsystem missing");
+        assert_eq!(alpha.subsystem_code, 0);
+        assert_eq!(beta.subsystem_code, 1);
+        assert_eq!(config.interconnects.len(), 2);
+        assert_eq!(config.interconnects[0].bridge_type, "demo::ZenohBridge");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_read_multi_configuration_rejects_wrong_direction() {
+        let dir = multi_config_test_dir("wrong_direction");
+        write_multi_config_file(&dir, "alpha.ron", alpha_subsystem_config());
+        write_multi_config_file(&dir, "beta.ron", beta_subsystem_config());
+        let network_path = write_multi_config_file(
+            &dir,
+            "network.ron",
+            r#"(
+                subsystems: [
+                    (id: "alpha", config: "alpha.ron"),
+                    (id: "beta", config: "beta.ron"),
+                ],
+                interconnects: [
+                    (from: "alpha/zenoh/pong", to: "beta/zenoh/ping", msg: "demo::Pong"),
+                ],
+            )"#,
+        );
+
+        let err = read_multi_configuration(network_path.to_str().expect("network path utf8"))
+            .expect_err("direction mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("must reference a Tx bridge channel"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_read_multi_configuration_rejects_declared_message_mismatch() {
+        let dir = multi_config_test_dir("msg_mismatch");
+        write_multi_config_file(&dir, "alpha.ron", alpha_subsystem_config());
+        write_multi_config_file(&dir, "beta.ron", beta_subsystem_config());
+        let network_path = write_multi_config_file(
+            &dir,
+            "network.ron",
+            r#"(
+                subsystems: [
+                    (id: "alpha", config: "alpha.ron"),
+                    (id: "beta", config: "beta.ron"),
+                ],
+                interconnects: [
+                    (from: "alpha/zenoh/ping", to: "beta/zenoh/ping", msg: "demo::Wrong"),
+                ],
+            )"#,
+        );
+
+        let err = read_multi_configuration(network_path.to_str().expect("network path utf8"))
+            .expect_err("message mismatch should fail");
+
+        assert!(
+            err.to_string()
+                .contains("declares message type 'demo::Wrong'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_read_multi_configuration_resolves_instance_override_root() {
+        let dir = multi_config_test_dir("instance_root");
+        write_multi_config_file(&dir, "robot.ron", instance_override_subsystem_config());
+        let network_path = write_multi_config_file(
+            &dir,
+            "multi_copper.ron",
+            r#"(
+                subsystems: [
+                    (id: "robot", config: "robot.ron"),
+                ],
+                interconnects: [],
+                instance_overrides_root: "instances",
+            )"#,
+        );
+
+        let config =
+            read_multi_configuration(network_path.to_str().expect("network path utf8")).unwrap();
+
+        assert_eq!(
+            config.instance_overrides_root.as_deref().map(Path::new),
+            Some(dir.join("instances").as_path())
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_resolve_subsystem_config_for_instance_applies_overrides() {
+        let dir = multi_config_test_dir("instance_apply");
+        write_multi_config_file(&dir, "robot.ron", instance_override_subsystem_config());
+        let instances_dir = dir.join("instances").join("17");
+        std::fs::create_dir_all(&instances_dir).expect("create instance dir");
+        write_multi_config_file(
+            &instances_dir,
+            "robot.ron",
+            r#"(
+                set: [
+                    (
+                        path: "tasks/imu/config",
+                        value: {
+                            "gyro_bias": [0.1, -0.2, 0.3],
+                        },
+                    ),
+                    (
+                        path: "resources/board/config",
+                        value: {
+                            "bus": "robot17-imu",
+                        },
+                    ),
+                    (
+                        path: "bridges/radio/config",
+                        value: {
+                            "mtu": 64,
+                        },
+                    ),
+                ],
+            )"#,
+        );
+        let network_path = write_multi_config_file(
+            &dir,
+            "multi_copper.ron",
+            r#"(
+                subsystems: [
+                    (id: "robot", config: "robot.ron"),
+                ],
+                interconnects: [],
+                instance_overrides_root: "instances",
+            )"#,
+        );
+
+        let multi =
+            read_multi_configuration(network_path.to_str().expect("network path utf8")).unwrap();
+        let effective = multi
+            .resolve_subsystem_config_for_instance("robot", 17)
+            .expect("effective config");
+
+        let graph = effective.get_graph(None).expect("graph");
+        let imu_id = graph.get_node_id_by_name("imu").expect("imu node");
+        let imu = graph.get_node(imu_id).expect("imu weight");
+        let imu_cfg = imu.get_instance_config().expect("imu config");
+        assert_eq!(imu_cfg.get::<u64>("sample_hz").unwrap(), Some(200));
+        let gyro_bias: Vec<f64> = imu_cfg
+            .get_value("gyro_bias")
+            .expect("gyro_bias deserialize")
+            .expect("gyro_bias value");
+        assert_eq!(gyro_bias, vec![0.1, -0.2, 0.3]);
+
+        let board = effective
+            .resources
+            .iter()
+            .find(|resource| resource.id == "board")
+            .expect("board resource");
+        assert_eq!(
+            board.config.as_ref().unwrap().get::<String>("bus").unwrap(),
+            Some("robot17-imu".to_string())
+        );
+
+        let radio = effective
+            .bridges
+            .iter()
+            .find(|bridge| bridge.id == "radio")
+            .expect("radio bridge");
+        assert_eq!(
+            radio.config.as_ref().unwrap().get::<u64>("mtu").unwrap(),
+            Some(64)
+        );
+
+        let radio_id = graph.get_node_id_by_name("radio").expect("radio node");
+        let radio_node = graph.get_node(radio_id).expect("radio weight");
+        assert_eq!(
+            radio_node
+                .get_instance_config()
+                .unwrap()
+                .get::<u64>("mtu")
+                .unwrap(),
+            Some(64)
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_resolve_subsystem_config_for_instance_rejects_unknown_path() {
+        let dir = multi_config_test_dir("instance_unknown");
+        write_multi_config_file(&dir, "robot.ron", instance_override_subsystem_config());
+        let instances_dir = dir.join("instances").join("17");
+        std::fs::create_dir_all(&instances_dir).expect("create instance dir");
+        write_multi_config_file(
+            &instances_dir,
+            "robot.ron",
+            r#"(
+                set: [
+                    (
+                        path: "tasks/missing/config",
+                        value: {
+                            "gyro_bias": [1.0, 2.0, 3.0],
+                        },
+                    ),
+                ],
+            )"#,
+        );
+        let network_path = write_multi_config_file(
+            &dir,
+            "multi_copper.ron",
+            r#"(
+                subsystems: [
+                    (id: "robot", config: "robot.ron"),
+                ],
+                interconnects: [],
+                instance_overrides_root: "instances",
+            )"#,
+        );
+
+        let multi =
+            read_multi_configuration(network_path.to_str().expect("network path utf8")).unwrap();
+        let err = multi
+            .resolve_subsystem_config_for_instance("robot", 17)
+            .expect_err("unknown task override should fail");
+
+        assert!(
+            err.to_string().contains("targets unknown task 'missing'"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -4,6 +4,7 @@ description = "Example showing image alignment using cu-aligner with pooled buff
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -15,11 +16,10 @@ publish = false
 
 [dependencies]
 cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
 cu29-clock = { workspace = true }
 tempfile = { workspace = true }
-cu-aligner = { path = "../../components/tasks/cu_aligner", version = "0.13.0" }
-cu-sensor-payloads = { path = "../../components/payloads/cu_sensor_payloads", version = "0.13.0" }
+cu-aligner = { path = "../../components/tasks/cu_aligner", version = "0.15.0" }
+cu-sensor-payloads = { path = "../../components/payloads/cu_sensor_payloads", version = "0.15.0" }
 paste = { workspace = true }
 serde = { workspace = true }
 

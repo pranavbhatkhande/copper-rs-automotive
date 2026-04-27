@@ -1,19 +1,27 @@
 use crate::curuntime::KeyFrame;
-use cu29_clock::RobotClock;
+use cu29_traits::CopperListTuple;
 use cu29_traits::CuResult;
 use cu29_unifiedlog::{SectionStorage, UnifiedLogWrite};
+
+#[cfg(feature = "std")]
+use crate::copperlist::CopperList;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use cu29_clock::RobotClockMock;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
 #[cfg(not(feature = "std"))]
 mod imp {
     pub use alloc::string::String;
-    pub use alloc::sync::Arc;
-    pub use spin::Mutex;
 }
 
 #[cfg(feature = "std")]
 mod imp {
     pub use crate::config::CuConfig;
     pub use crate::simulation::SimOverride;
+    pub use cu29_clock::RobotClock;
     pub use cu29_unifiedlog::memmap::MmapSectionStorage;
     pub use std::sync::{Arc, Mutex};
 }
@@ -33,6 +41,36 @@ impl<T> CuStdApplication for T where
 {
 }
 
+/// Compile-time subsystem identity embedded in generated Copper applications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Subsystem {
+    id: Option<&'static str>,
+    code: u16,
+}
+
+impl Subsystem {
+    #[inline]
+    pub const fn new(id: Option<&'static str>, code: u16) -> Self {
+        Self { id, code }
+    }
+
+    #[inline]
+    pub const fn id(self) -> Option<&'static str> {
+        self.id
+    }
+
+    #[inline]
+    pub const fn code(self) -> u16 {
+        self.code
+    }
+}
+
+/// Compile-time subsystem identity embedded in generated Copper applications.
+pub trait CuSubsystemMetadata {
+    /// Multi-Copper subsystem identity for this generated application.
+    fn subsystem() -> Subsystem;
+}
+
 /// A trait that defines the structure and behavior of a CuApplication.
 ///
 /// CuApplication is the normal, running on robot version of an application and its runtime.
@@ -46,30 +84,6 @@ pub trait CuApplication<S: SectionStorage, L: UnifiedLogWrite<S> + 'static> {
     /// Returns the original configuration as a string, typically loaded from a RON file.
     /// This configuration represents the default settings for the application before any overrides.
     fn get_original_config() -> String;
-
-    /// Creates a new application.
-    ///
-    /// # Arguments
-    ///
-    /// * `clock` - A `RobotClock` instance to be used for time-related operations in the implementing struct.
-    /// * `unified_logger` - A thread-safe, shared reference to `UnifiedLoggerWrite`, enabling logging functionalities.
-    /// * `config_override` - An optional `CuConfig` instance that allows overriding the default configuration values.
-    ///   - If `Some`, the provided configuration will be used.
-    ///   - If `None`, the default configuration will be applied.
-    ///
-    /// # Returns
-    ///
-    /// A result containing either:
-    /// - An instantiated object of the implementing type (`Self`), or
-    /// - A `CuResult` error in case of failure during initialization.
-    ///
-    fn new(
-        clock: RobotClock,
-        unified_logger: Arc<Mutex<L>>,
-        #[cfg(feature = "std")] config_override: Option<CuConfig>, // No config override in no-std, the bundled config is always the config
-    ) -> CuResult<Self>
-    where
-        Self: Sized;
 
     /// Starts all tasks managed by the application/runtime.
     ///
@@ -129,31 +143,10 @@ pub trait CuSimApplication<S: SectionStorage, L: UnifiedLogWrite<S> + 'static> {
     /// This configuration represents the default settings for the application before any overrides.
     fn get_original_config() -> String;
 
-    /// Creates a new simulation-enabled application.
-    ///
-    /// # Arguments
-    ///
-    /// * `clock` - A `RobotClock` instance to be used for time-related operations in the implementing struct.
-    /// * `unified_logger` - A thread-safe, shared reference to `UnifiedLoggerWrite`, enabling logging functionalities.
-    /// * `config_override` - An optional `CuConfig` instance that allows overriding the default configuration values.
-    ///   - If `Some`, the provided configuration will be used.
-    ///   - If `None`, the default configuration will be applied.
-    /// * `sim_callback` - A mutable function reference that allows overriding individual simulation steps.
-    ///   The callback receives a Step parameter and returns a SimOverride indicating how to handle the step.
-    ///
-    /// # Returns
-    ///
-    /// A result containing either:
-    /// - An instantiated object of the implementing type (`Self`), or
-    /// - A `CuResult` error in case of failure during initialization.
-    fn new(
-        clock: RobotClock,
-        unified_logger: Arc<Mutex<L>>,
-        config_override: Option<CuConfig>,
-        sim_callback: &mut impl for<'z> FnMut(Self::Step<'z>) -> SimOverride,
-    ) -> CuResult<Self>
-    where
-        Self: Sized;
+    /// Returns the mission id this generated application is bound to, when applicable.
+    fn mission_id() -> Option<&'static str> {
+        None
+    }
 
     /// Starts all tasks managed by the application/runtime in simulation mode.
     ///
@@ -217,4 +210,59 @@ pub trait CuSimApplication<S: SectionStorage, L: UnifiedLogWrite<S> + 'static> {
 
     /// Restore all tasks from the given frozen state
     fn restore_keyframe(&mut self, freezer: &KeyFrame) -> CuResult<()>;
+}
+
+/// Optional introspection hook exposing the latest runtime-generated CopperList snapshot.
+///
+/// This is remote-debug-only: debugger conveniences must not add unconditional
+/// runtime-path overhead to normal Copper builds. Non-`remote-debug` builds
+/// should implement this as a cheap `None`.
+pub trait CurrentRuntimeCopperList<P: CopperListTuple> {
+    fn current_runtime_copperlist_bytes(&self) -> Option<&[u8]>;
+
+    fn set_current_runtime_copperlist_bytes(&mut self, snapshot: Option<Vec<u8>>) {
+        let _ = snapshot;
+    }
+}
+
+/// Simulation-enabled applications that can replay a recorded CopperList verbatim.
+///
+/// This is the exact-output replay primitive used by deterministic re-sim flows:
+/// task outputs and bridge receives are overridden from the recorded CopperList,
+/// bridge sends are skipped, and an optional recorded keyframe can be injected
+/// verbatim when the current CL is expected to capture one.
+#[cfg(feature = "std")]
+pub trait CuRecordedReplayApplication<S: SectionStorage, L: UnifiedLogWrite<S> + 'static>:
+    CuSimApplication<S, L>
+{
+    /// The generated recorded CopperList payload set for this application.
+    type RecordedDataSet: CopperListTuple;
+
+    /// Replay one recorded CopperList exactly as logged.
+    fn replay_recorded_copperlist(
+        &mut self,
+        clock_mock: &RobotClockMock,
+        copperlist: &CopperList<Self::RecordedDataSet>,
+        keyframe: Option<&KeyFrame>,
+    ) -> CuResult<()>;
+}
+
+/// Simulation-enabled applications that can be instantiated for distributed replay.
+///
+/// This extends exact-output replay with the one extra capability the
+/// distributed engine needs: build a replayable app for a specific
+/// deployment `instance_id` while keeping app construction type-safe.
+#[cfg(feature = "std")]
+pub trait CuDistributedReplayApplication<S: SectionStorage, L: UnifiedLogWrite<S> + 'static>:
+    CuRecordedReplayApplication<S, L> + CuSubsystemMetadata
+{
+    /// Build this app for deterministic distributed replay.
+    fn build_distributed_replay(
+        clock: RobotClock,
+        unified_logger: Arc<Mutex<L>>,
+        instance_id: u32,
+        config_override: Option<CuConfig>,
+    ) -> CuResult<Self>
+    where
+        Self: Sized;
 }

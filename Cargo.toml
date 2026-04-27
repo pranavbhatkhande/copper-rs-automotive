@@ -22,8 +22,9 @@ members = [
   "components/bridges/cu_iceoryx2_bridge",
   "components/bridges/cu_zenoh_bridge",
   "components/bridges/cu_ros2_bridge",
+  "components/codecs/cu_ffv1_codec",
+  "components/codecs/cu_png_codec",
   "components/libs/cu_msp_lib",
-  "components/libs/cu_embedded_registry",
   "components/libs/cu_transform",
   "core/cu29_units",
   "components/libs/cu_tuimon",
@@ -56,24 +57,25 @@ members = [
   "components/sources/cu_vlp16",
   "components/sources/cu_wt901",
   "components/sources/cu_rp_encoder",
+  "components/sources/cu_sen0682",
   "components/tasks/cu_aligner",
   "components/tasks/cu_ahrs",
   "components/tasks/cu_apriltag",
   "components/tasks/cu_dynthreshold",
   "components/tasks/cu_pid",
+  "components/tasks/cu_python_task",
   "components/tasks/cu_ratelimit",
   "components/testing/cu_udp_inject",
-  "examples/cu_elrs_bdshot_demo",
-  "examples/cu_feetech_demo",
   "examples/cu_background_task",
-  "examples/cu_flight_controller",
   "examples/cu_bridge_test",
   "examples/cu_bevymon_demo",
   "examples/cu_caterpillar",
+  "examples/cu_distributed_resim_demo",
   "examples/cu_config_gen",
   "examples/cu_config_variation",
-  "examples/cu_dorabench",
+  "examples/cu_image_codec_demo",
   "examples/cu_image_aligner",
+  "examples/cu_instance_overrides_demo",
   "examples/cu_iceoryx2_bridge_demo",
   "examples/cu_logging_size",
   "examples/cu_logviz_demo",
@@ -89,15 +91,17 @@ members = [
   "examples/cu_rate_target",
   "examples/cu_reflect_demo",
   "examples/cu_pointclouds",
-  "examples/cu_rp_balancebot",
+  "examples/cu_python_task_demo",
   "examples/cu_run_in_sim",
   "examples/cu_standalone_structlog",
   "examples/cu_zenoh",
+  "examples/cu_zenoh_bridge_bench",
   "examples/cu_zenoh_bridge_demo",
   "examples/cu_ros2_bridge_demo",
-  "examples/cu_human_pose",
   "examples/cu_debug_session",
-  "examples/cu_gnss_ublox_demo",
+  "examples/cu_async_cl_io_bench",
+  "examples/cu_runtime_matrix",
+  "examples/cu_parallel_mandelbrot",
   "examples/cu_remote_debug_session",
   "components/payloads/cu_automotive_payloads",
   "components/tasks/cu_can",
@@ -138,9 +142,10 @@ debug = 2
 soft_ratatui = { path = "vendor/soft_ratatui" }
 
 [workspace.package]
-version = "0.13.1"
+version = "0.15.0"
 authors = ["Guillaume Binet <gbin@gootz.net>"]
 edition = "2024"
+rust-version = "1.95"
 license = "Apache-2.0"
 keywords = ["robotics", "middleware", "copper", "real-time"]
 categories = ["science::robotics"]
@@ -153,38 +158,40 @@ no_individual_tags = true
 [workspace.dependencies]
 
 # Copper Core
-cu29 = { path = "core/cu29", version = "0.13.0" } # default std
-cu29-reflect-derive = { path = "core/cu29_reflect_derive", version = "0.13.0" }
-cu29-clock = { path = "core/cu29_clock", default-features = false, version = "0.13.0" }
-cu29-derive = { path = "core/cu29_derive", default-features = false, version = "0.13.0" }
-cu29-export = { path = "core/cu29_export", version = "0.13.0" } # std only
-cu29-helpers = { path = "core/cu29_helpers", version = "0.13.0" } # std only
-cu29-intern-strs = { path = "core/cu29_intern_strs", version = "0.13.0" } # std only
-cu29-log = { path = "core/cu29_log", default-features = false, version = "0.13.0" }
-cu29-log-derive = { path = "core/cu29_log_derive", default-features = false, version = "0.13.0" }
-cu29-log-runtime = { path = "core/cu29_log_runtime", default-features = false, version = "0.13.0" }
-cu29-logviz = { path = "core/cu29_logviz", version = "0.13.0" }
-cu29-runtime = { path = "core/cu29_runtime", default-features = false, version = "0.13.0" }
-cu29-soa-derive = { path = "core/cu29_soa_derive", default-features = false, version = "0.13.0" }
-cu29-traits = { path = "core/cu29_traits", default-features = false, version = "0.13.0" }
+cu29 = { path = "core/cu29", version = "0.15.0" } # default std
+cu29-reflect-derive = { path = "core/cu29_reflect_derive", version = "0.15.0" }
+cu29-clock = { path = "core/cu29_clock", default-features = false, version = "0.15.0" }
+cu29-derive = { path = "core/cu29_derive", default-features = false, version = "0.15.0" }
+cu29-export = { path = "core/cu29_export", version = "0.15.0" } # std only
+cu29-helpers = { path = "core/cu29_helpers", version = "0.15.0" } # compatibility stub
+cu29-intern-strs = { path = "core/cu29_intern_strs", version = "0.15.0" } # std only
+cu29-log = { path = "core/cu29_log", default-features = false, version = "0.15.0" }
+cu29-log-derive = { path = "core/cu29_log_derive", default-features = false, version = "0.15.0" }
+cu29-log-runtime = { path = "core/cu29_log_runtime", default-features = false, version = "0.15.0" }
+cu29-logviz = { path = "core/cu29_logviz", version = "0.15.0" }
+cu29-runtime = { path = "core/cu29_runtime", default-features = false, version = "0.15.0" }
+cu29-soa-derive = { path = "core/cu29_soa_derive", default-features = false, version = "0.15.0" }
+cu29-traits = { path = "core/cu29_traits", default-features = false, version = "0.15.0" }
 cu29-unifiedlog = { path = "core/cu29_unifiedlog", default-features = false, features = [
   "compact",
-], version = "0.13.0" }
-cu29-units = { path = "core/cu29_units", version = "0.13.0" }
-cu29-value = { path = "core/cu29_value", default-features = false, version = "0.13.0" }
-cu-linux-resources = { path = "components/res/cu_linux_resources", version = "0.13.0" }
+], version = "0.15.0" }
+cu29-units = { path = "core/cu29_units", version = "0.15.0" }
+cu29-value = { path = "core/cu29_value", default-features = false, version = "0.15.0" }
+cu-ffv1-codec = { path = "components/codecs/cu_ffv1_codec", version = "0.15.0" }
+cu-linux-resources = { path = "components/res/cu_linux_resources", version = "0.15.0" }
+cu-png-codec = { path = "components/codecs/cu_png_codec", version = "0.15.0" }
 
 # Payload definitions
-cu-sensor-payloads = { path = "components/payloads/cu_sensor_payloads", version = "0.13.0" }
-cu-gnss-payloads = { path = "components/payloads/cu_gnss_payloads", version = "0.13.0" }
-cu-spatial-payloads = { path = "components/payloads/cu_spatial_payloads", version = "0.13.0" }
-cu-ros2-payloads = { path = "components/payloads/cu_ros2_payloads", version = "0.13.0" }
-cu-automotive-payloads = { path = "components/payloads/cu_automotive_payloads", version = "0.13.0" }
-cu-can = { path = "components/tasks/cu_can", version = "0.13.0" }
-cu-isotp = { path = "components/tasks/cu_isotp", version = "0.13.0" }
-cu-uds = { path = "components/tasks/cu_uds", version = "0.13.0" }
-cu-someip = { path = "components/tasks/cu_someip", version = "0.13.0" }
-cu-pid = { path = "components/tasks/cu_pid", version = "0.13.0" }
+cu-sensor-payloads = { path = "components/payloads/cu_sensor_payloads", version = "0.15.0" }
+cu-gnss-payloads = { path = "components/payloads/cu_gnss_payloads", version = "0.15.0" }
+cu-spatial-payloads = { path = "components/payloads/cu_spatial_payloads", version = "0.15.0" }
+cu-ros2-payloads = { path = "components/payloads/cu_ros2_payloads", version = "0.15.0" }
+cu-automotive-payloads = { path = "components/payloads/cu_automotive_payloads", version = "0.15.0" }
+cu-can = { path = "components/tasks/cu_can", version = "0.15.0" }
+cu-isotp = { path = "components/tasks/cu_isotp", version = "0.15.0" }
+cu-uds = { path = "components/tasks/cu_uds", version = "0.15.0" }
+cu-someip = { path = "components/tasks/cu_someip", version = "0.15.0" }
+cu-pid = { path = "components/tasks/cu_pid", version = "0.15.0" }
 
 # External serialization
 bincode = { package = "cu-bincode", version = "2.0", default-features = false, features = [
@@ -203,6 +210,7 @@ erased-serde = { version = "0.4", default-features = false, features = [
   "alloc",
 ] }
 serde_derive = { version = "1.0", features = ["default"] }
+pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
 
 # External CLI
 clap = { version = "4.5", default-features = false, features = [
@@ -218,6 +226,11 @@ proc-macro2 = { version = "1.0", default-features = false }
 quote = { version = "1.0", default-features = false } # proc macros
 syn = { version = "2.0", default-features = false, features = [
   "full",
+  "derive",
+  "parsing",
+  "printing",
+  "proc-macro",
+  "clone-impls",
 ] } # proc macros
 
 # Unit of measure to be consistent across the project
@@ -237,6 +250,7 @@ paste = { version = "1.0.15", default-features = false }
 bevy_reflect = { version = "0.18.0", default-features = false, features = [
   "auto_register_static",
 ] }
+bevy_reflect_derive = "0.18.0"
 
 # used across testing
 tempfile = { version = "3.23", default-features = false }
@@ -244,7 +258,7 @@ tempfile = { version = "3.23", default-features = false }
 spin = { version = "0.10" } # should be removed when std is on, but cargo is bad at negative features
 
 # rerun
-rerun = { version = "0.30", default-features = false, features = [
+rerun = { version = "0.31", default-features = false, features = [
   "sdk",
   "server",
   "log",
@@ -261,15 +275,15 @@ rayon = "1.11"
 rtsan-standalone = { version = "0.3.0", default-features = false }
 
 # HashMap that is fast and has no std dependency
-hashbrown = { version = "0.16", features = ["serde"] }
+hashbrown = { version = "0.17", features = ["serde"] }
 
 # Shared external dependencies of workspace members.
 anyhow = { version = "1.0", default-features = false }
 arrayvec = { version = "0.7", default-features = false }
-avian3d = { version = "0.5.0", default-features = false }
+avian3d = { version = "0.6.1", default-features = false }
 bevy = { version = "0.18.0", default-features = false }
 bevy_ratatui = { version = "0.11.1", default-features = false }
-buddy_system_allocator = { version = "0.12", default-features = false }
+buddy_system_allocator = { version = "0.13", default-features = false }
 bytemuck = "1.23.0"
 cached-path = { version = "0.10.0", default-features = false }
 cfg_aliases = "0.2.1"
@@ -281,11 +295,17 @@ ctrlc = "3.5"
 defmt = { version = "1.0", default-features = false }
 defmt-rtt = "1.1"
 embedded-alloc = { version = "0.7", default-features = false }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = [
+  "codec",
+  "format",
+] }
 gstreamer = { version = "0.25", default-features = false }
 image = { version = "0.25.6", default-features = false }
+png = "0.18.1"
 libc = { version = "0.2", default-features = false }
 linux-embedded-hal = "0.4.0"
 log = { version = "0.4", default-features = false }
+minicbor = { version = "2.2.1", default-features = false }
 minicbor-serde = { version = "0.6.2", default-features = false }
 nix = { version = "0.31", default-features = false }
 panic-probe = "1.0"

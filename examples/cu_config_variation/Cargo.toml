@@ -4,6 +4,7 @@ description = "Example of a Copper configuration with programmatic multiple vari
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -13,9 +14,8 @@ repository.workspace = true
 publish = false
 [dependencies]
 cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
-cu-caterpillar = { path = "../cu_caterpillar", version = "0.13.0" }
-cu-rp-gpio = { path = "../../components/sinks/cu_rp_gpio", version = "0.13.0" }
+cu-caterpillar = { path = "../cu_caterpillar", version = "0.15.0" }
+cu-rp-gpio = { path = "../../components/sinks/cu_rp_gpio", version = "0.15.0" }
 serde = { workspace = true }
 
 [package.metadata.cargo-shear]

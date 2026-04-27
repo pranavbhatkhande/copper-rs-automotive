@@ -4,6 +4,7 @@ readme = "README.md"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -11,11 +12,17 @@ homepage.workspace = true
 repository.workspace = true
 description = "Standardized GNSS payload definitions for Copper"
 
+[package.metadata.copper]
+kind = "payload"
+domains = ["payload/gnss"]
+environments = ["host", "embedded"]
+
 [dependencies]
 bincode = { workspace = true }
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false, features = [
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false, features = [
   "units",
 ] }
+cu-spatial-payloads = { path = "../cu_spatial_payloads", version = "0.15.0", default-features = false }
 serde = { workspace = true }
 
 [features]

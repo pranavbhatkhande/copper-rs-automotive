@@ -3,6 +3,7 @@ name = "cu-apriltag"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -10,12 +11,17 @@ homepage.workspace = true
 repository.workspace = true
 description = "AprilTag detection and pose for Copper"
 
+[package.metadata.copper]
+kind = "task"
+domains = ["algorithm/perception", "vision/apriltag"]
+environments = ["host"]
+
 [dependencies]
 bincode = { workspace = true }
 cu29 = { workspace = true }
 serde = { workspace = true }
-cu-spatial-payloads = { path = "../../payloads/cu_spatial_payloads", version = "0.13.0" }
-cu-sensor-payloads = { path = "../../payloads/cu_sensor_payloads", version = "0.13.0" }
+cu-spatial-payloads = { path = "../../payloads/cu_spatial_payloads", version = "0.15.0" }
+cu-sensor-payloads = { path = "../../payloads/cu_sensor_payloads", version = "0.15.0" }
 
 [target.'cfg(unix)'.dependencies]
 apriltag = { version = "0.4.0" }

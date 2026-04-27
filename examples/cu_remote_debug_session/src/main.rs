@@ -8,7 +8,6 @@ use cu29::prelude::*;
 use cu29::remote_debug::{
     RemoteDebugPaths, RemoteDebugZenohClient, RemoteDebugZenohServer, SessionOpenParams, WireCodec,
 };
-use cu29_helpers::basic_copper_setup;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
@@ -149,18 +148,13 @@ fn record_log() -> CuResult<()> {
     clean_logs()?;
     println!("[record] Creating mock clock and logger context");
     let (clock, clock_mock) = RobotClock::mock();
-    let ctx = basic_copper_setup(
-        Path::new(LOG_PATH),
-        LOG_SLAB_SIZE,
-        /*text_log=*/ false,
-        Some(clock.clone()),
-    )?;
 
     let mut sim_cb = |_step: default::SimStep| SimOverride::ExecuteByRuntime;
 
     println!("[record] Building debug app");
-    let mut app = DebugAppBuilder::new()
-        .with_context(&ctx)
+    let mut app = DebugApp::builder()
+        .with_clock(clock.clone())
+        .with_log_path(Path::new(LOG_PATH), LOG_SLAB_SIZE)?
         .with_sim_callback(&mut sim_cb)
         .build()?;
 
@@ -185,7 +179,8 @@ fn time_of(cl: &CopperList<default::CuStampedDataSet>) -> Option<CuTime> {
 
 fn build_cb<'a>(
     cl: &'a CopperList<default::CuStampedDataSet>,
-    _clock_for_cb: RobotClock,
+    _process_clock: RobotClock,
+    _clock_for_cb: RobotClockMock,
 ) -> Box<dyn for<'z> FnMut(default::SimStep<'z>) -> SimOverride + 'a> {
     let src_out = cl.msgs.get_src_output().clone();
     Box::new(move |step: default::SimStep<'_>| match step {
@@ -200,16 +195,11 @@ fn build_cb<'a>(
 fn app_factory(_params: &SessionOpenParams) -> CuResult<(DebugApp, RobotClock, RobotClockMock)> {
     println!("[server] Building replay app instance");
     let (clock, clock_mock) = RobotClock::mock();
-    let ctx = basic_copper_setup(
-        Path::new(REPLAY_LOG_PATH),
-        REPLAY_LOG_SLAB_SIZE,
-        /*text_log=*/ false,
-        Some(clock.clone()),
-    )?;
 
     let mut sim_cb = |_step: default::SimStep| SimOverride::ExecuteByRuntime;
-    let app = DebugAppBuilder::new()
-        .with_context(&ctx)
+    let app = DebugApp::builder()
+        .with_clock(clock.clone())
+        .with_log_path(Path::new(REPLAY_LOG_PATH), REPLAY_LOG_SLAB_SIZE)?
         .with_sim_callback(&mut sim_cb)
         .build()?;
 
@@ -500,12 +490,7 @@ fn run_remote_debug_session() -> CuResult<()> {
         json!({"type_path": first_type, "format": "jsonschema"}),
     )?;
 
-    let _ = call_step(
-        &client,
-        Some(&session_id),
-        "schema.get_payload_map",
-        json!({}),
-    )?;
+    let _ = call_step(&client, Some(&session_id), "schema.get_outputs", json!({}))?;
 
     let _ = call_step(
         &client,

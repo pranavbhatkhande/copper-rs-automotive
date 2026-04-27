@@ -7,7 +7,7 @@
 //!   with a tiny LRU cache for snappy stepping.
 //! - Reuse the public `CuSimApplication` API and user-provided sim callbacks.
 
-use crate::app::CuSimApplication;
+use crate::app::{CuSimApplication, CurrentRuntimeCopperList};
 use crate::curuntime::KeyFrame;
 use crate::reflect::{ReflectTaskIntrospection, TypeRegistry, dump_type_registry_schema};
 use crate::simulation::SimOverride;
@@ -50,13 +50,13 @@ pub struct SectionCacheStats {
 /// Metadata for one copperlist section (no payload kept).
 #[derive(Debug, Clone)]
 pub(crate) struct SectionIndexEntry {
-    pos: LogPosition,
-    start_idx: usize,
-    len: usize,
-    first_id: u64,
-    last_id: u64,
-    first_ts: Option<CuTime>,
-    last_ts: Option<CuTime>,
+    pub(crate) pos: LogPosition,
+    pub(crate) start_idx: usize,
+    pub(crate) len: usize,
+    pub(crate) first_id: u64,
+    pub(crate) last_id: u64,
+    pub(crate) first_ts: Option<CuTime>,
+    pub(crate) last_ts: Option<CuTime>,
 }
 
 /// Cached copperlists for one section.
@@ -69,9 +69,9 @@ struct CachedSection<P: CopperListTuple> {
 /// A reusable debugging session that can time-travel within a recorded log.
 ///
 /// `CB` builds a simulation callback for a specific copperlist entry. This keeps the
-/// API generic: the caller can replay recorded outputs, poke clocks, or inject extra
-/// assertions inside the callback. `TF` extracts a timestamp from a copperlist to
-/// support time-based seeking.
+/// API generic: the caller can replay recorded outputs, drive the mock clock inside a
+/// CopperList, or inject extra assertions inside the callback. `TF` extracts a
+/// timestamp from a copperlist to support time-based seeking.
 const DEFAULT_SECTION_CACHE_CAP: usize = 8;
 pub struct CuDebugSession<App, P, CB, TF, S, L>
 where
@@ -106,10 +106,11 @@ where
     App: CuSimApplication<S, L>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     ) -> Box<dyn for<'z> FnMut(App::Step<'z>) -> SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
 {
@@ -122,6 +123,7 @@ where
         build_callback: CB,
         time_of: TF,
     ) -> CuResult<Self> {
+        let _ = crate::logcodec::seed_effective_config_from_log::<P>(log_base)?;
         let (sections, keyframes, total_entries) = index_log::<P, _>(log_base, &time_of)?;
         let log_reader = build_read_logger(log_base)?;
         Ok(Self::new(
@@ -147,6 +149,7 @@ where
         time_of: TF,
         cache_cap: usize,
     ) -> CuResult<Self> {
+        let _ = crate::logcodec::seed_effective_config_from_log::<P>(log_base)?;
         let (sections, keyframes, total_entries) = index_log::<P, _>(log_base, &time_of)?;
         let log_reader = build_read_logger(log_base)?;
         Ok(Self::new_with_cache_cap(
@@ -226,6 +229,16 @@ where
         }
     }
 
+    #[inline]
+    pub fn app(&self) -> &App {
+        &self.app
+    }
+
+    #[inline]
+    pub fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
     fn ensure_started(&mut self) -> CuResult<()> {
         if self.started {
             return Ok(());
@@ -248,6 +261,42 @@ where
         self.app.restore_keyframe(kf)?;
         self.clock_mock.set_value(kf.timestamp.as_nanos());
         self.last_keyframe = Some(kf.culistid);
+        Ok(())
+    }
+
+    fn clear_runtime_copperlist_snapshot(&mut self)
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
+        self.app.set_current_runtime_copperlist_bytes(None);
+    }
+
+    fn normalize_runtime_copperlist_snapshot(
+        &mut self,
+        recorded: &crate::copperlist::CopperList<P>,
+    ) -> CuResult<()>
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
+        let normalized = self
+            .app
+            .current_runtime_copperlist_bytes()
+            .map(|bytes| {
+                let (mut runtime_cl, _) = bincode::decode_from_slice::<
+                    crate::copperlist::CopperList<P>,
+                    _,
+                >(bytes, standard())
+                .map_err(|e| {
+                    CuError::new_with_cause("Failed to decode runtime CopperList snapshot", e)
+                })?;
+                runtime_cl.id = recorded.id;
+                runtime_cl.change_state(recorded.get_state());
+                bincode::encode_to_vec(&runtime_cl, standard()).map_err(|e| {
+                    CuError::new_with_cause("Failed to encode normalized CopperList snapshot", e)
+                })
+            })
+            .transpose()?;
+        self.app.set_current_runtime_copperlist_bytes(normalized);
         Ok(())
     }
 
@@ -435,7 +484,10 @@ where
         Err(CuError::from("Timestamp not found within section"))
     }
 
-    fn replay_range(&mut self, start: usize, end: usize) -> CuResult<usize> {
+    fn replay_range(&mut self, start: usize, end: usize) -> CuResult<usize>
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
         let mut replayed = 0usize;
         for idx in start..=end {
             let (entry, ts) = self.copperlist_at(idx)?;
@@ -443,15 +495,20 @@ where
                 self.clock_mock.set_value(ts.as_nanos());
             }
             let clock_for_cb = self.robot_clock.clone();
-            let mut cb = (self.build_callback)(entry.as_ref(), clock_for_cb);
+            let clock_mock_for_cb = self.clock_mock.clone();
+            let mut cb = (self.build_callback)(entry.as_ref(), clock_for_cb, clock_mock_for_cb);
             self.app.run_one_iteration(&mut cb)?;
+            self.normalize_runtime_copperlist_snapshot(entry.as_ref())?;
             replayed += 1;
             self.current_idx = Some(idx);
         }
         Ok(replayed)
     }
 
-    fn goto_index(&mut self, target_idx: usize) -> CuResult<JumpOutcome> {
+    fn goto_index(&mut self, target_idx: usize) -> CuResult<JumpOutcome>
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
         self.ensure_started()?;
         if target_idx >= self.total_entries {
             return Err(CuError::from("Target index outside log"));
@@ -481,6 +538,7 @@ where
                     return Err(CuError::from("No keyframe available to rewind"));
                 };
                 self.restore_keyframe(&kf)?;
+                self.clear_runtime_copperlist_snapshot();
                 keyframe_used = Some(kf.culistid);
                 replay_start = self.index_for_culistid(kf.culistid)?;
             }
@@ -490,6 +548,7 @@ where
                 return Err(CuError::from("No keyframe found in log"));
             };
             self.restore_keyframe(&kf)?;
+            self.clear_runtime_copperlist_snapshot();
             keyframe_used = Some(kf.culistid);
             replay_start = self.index_for_culistid(kf.culistid)?;
         }
@@ -510,19 +569,28 @@ where
     }
 
     /// Jump to a copperlist by id.
-    pub fn goto_cl(&mut self, culistid: u64) -> CuResult<JumpOutcome> {
+    pub fn goto_cl(&mut self, culistid: u64) -> CuResult<JumpOutcome>
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
         let idx = self.index_for_culistid(culistid)?;
         self.goto_index(idx)
     }
 
     /// Jump to the first copperlist at or after a timestamp.
-    pub fn goto_time(&mut self, ts: CuTime) -> CuResult<JumpOutcome> {
+    pub fn goto_time(&mut self, ts: CuTime) -> CuResult<JumpOutcome>
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
         let idx = self.index_for_time(ts)?;
         self.goto_index(idx)
     }
 
     /// Step relative to the current cursor. Negative values rewind via keyframe.
-    pub fn step(&mut self, delta: i32) -> CuResult<JumpOutcome> {
+    pub fn step(&mut self, delta: i32) -> CuResult<JumpOutcome>
+    where
+        App: CurrentRuntimeCopperList<P>,
+    {
         let current =
             self.current_idx
                 .ok_or_else(|| CuError::from("Cannot step before any jump"))? as i32;
@@ -590,6 +658,7 @@ where
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     ) -> Box<dyn for<'z> FnMut(App::Step<'z>) -> SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
 {
@@ -639,7 +708,7 @@ where
 }
 /// Decode all copperlists contained in a single unified-log section.
 #[allow(clippy::type_complexity)]
-fn decode_copperlists<
+pub(crate) fn decode_copperlists<
     P: CopperListTuple,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime>,
 >(
@@ -735,7 +804,7 @@ fn scan_copperlist_section<
 }
 
 /// Build a reusable read-only unified logger for this session.
-fn build_read_logger(log_base: &Path) -> CuResult<UnifiedLoggerRead> {
+pub(crate) fn build_read_logger(log_base: &Path) -> CuResult<UnifiedLoggerRead> {
     let logger = UnifiedLoggerBuilder::new()
         .file_base_name(log_base)
         .build()
@@ -747,7 +816,7 @@ fn build_read_logger(log_base: &Path) -> CuResult<UnifiedLoggerRead> {
 }
 
 /// Read a specific section at a given position from disk using an existing handle.
-fn read_section_at(
+pub(crate) fn read_section_at(
     log_reader: &mut UnifiedLoggerRead,
     pos: LogPosition,
 ) -> CuResult<(SectionHeader, Vec<u8>)> {
@@ -756,7 +825,7 @@ fn read_section_at(
 }
 
 /// Build a section-level index in one pass (copperlists + keyframes).
-fn index_log<P, TF>(
+pub(crate) fn index_log<P, TF>(
     log_base: &Path,
     time_of: &TF,
 ) -> CuResult<(Vec<SectionIndexEntry>, Vec<KeyFrame>, usize)>

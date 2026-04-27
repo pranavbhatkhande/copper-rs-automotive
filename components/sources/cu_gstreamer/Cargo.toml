@@ -5,11 +5,17 @@ description = "This is a Copper GStreamer sink."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
+
+[package.metadata.copper]
+kind = "source"
+domains = ["sensor/camera"]
+environments = ["host"]
 
 [dependencies]
 cu29 = { workspace = true }
@@ -22,7 +28,6 @@ serde = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rerun = { workspace = true }
-cu29-helpers = { workspace = true }
 
 [build-dependencies]
 cfg_aliases = { workspace = true }

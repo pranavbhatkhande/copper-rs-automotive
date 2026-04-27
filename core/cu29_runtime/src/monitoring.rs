@@ -4,9 +4,14 @@
 use crate::config::CuConfig;
 use crate::config::{
     BridgeChannelConfigRepresentation, BridgeConfig, ComponentConfig, CuGraph, Flavor, NodeId,
+    TaskKind, resolve_task_kind_for_id,
 };
 use crate::context::CuContext;
 use crate::cutask::CuMsgMetadata;
+use bincode::Encode;
+use bincode::config::standard;
+use bincode::enc::EncoderImpl;
+use bincode::enc::write::SizeWriter;
 use compact_str::CompactString;
 use cu29_clock::CuDuration;
 #[allow(unused_imports)]
@@ -15,14 +20,34 @@ use cu29_log::CuLogLevel;
 use cu29_log_runtime::{
     format_message_only, register_live_log_listener, unregister_live_log_listener,
 };
-use cu29_traits::{CuError, CuResult};
+use cu29_traits::{
+    CuError, CuResult, ObservedWriter, abort_observed_encode, begin_observed_encode,
+    finish_observed_encode,
+};
+use portable_atomic::{
+    AtomicBool as PortableAtomicBool, AtomicU64 as PortableAtomicU64, Ordering as PortableOrdering,
+};
 use serde_derive::{Deserialize, Serialize};
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
 #[cfg(feature = "std")]
-use std::sync::Arc;
+use core::cell::Cell;
+#[cfg(feature = "std")]
+use std::backtrace::Backtrace;
+#[cfg(feature = "std")]
+use std::fs::File;
+#[cfg(feature = "std")]
+use std::io::Write;
+#[cfg(feature = "std")]
+use std::panic::PanicHookInfo;
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+#[cfg(feature = "std")]
+use std::thread_local;
+#[cfg(feature = "std")]
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "std")]
 use std::{collections::HashMap as Map, string::String, string::ToString, vec::Vec};
 
@@ -30,6 +55,8 @@ use std::{collections::HashMap as Map, string::String, string::ToString, vec::Ve
 use alloc::{collections::BTreeMap as Map, string::String, string::ToString, vec::Vec};
 #[cfg(not(target_has_atomic = "64"))]
 use spin::Mutex;
+#[cfg(not(feature = "std"))]
+use spin::Mutex as SpinMutex;
 
 #[cfg(not(feature = "std"))]
 mod imp {
@@ -534,6 +561,8 @@ impl MonitorComponentMetadata {
 #[derive(Debug, Clone)]
 pub struct CuMonitoringMetadata {
     mission_id: CompactString,
+    subsystem_id: Option<CompactString>,
+    instance_id: u32,
     layout: CopperListLayout,
     copperlist_info: CopperListInfo,
     topology: MonitorTopology,
@@ -553,6 +582,8 @@ impl CuMonitoringMetadata {
         Self::validate_culist_mapping(components.len(), culist_component_mapping)?;
         Ok(Self {
             mission_id,
+            subsystem_id: None,
+            instance_id: 0,
             layout: CopperListLayout::new(components, culist_component_mapping),
             copperlist_info,
             topology,
@@ -593,6 +624,17 @@ impl CuMonitoringMetadata {
     /// Active mission identifier for this runtime instance.
     pub fn mission_id(&self) -> &str {
         self.mission_id.as_str()
+    }
+
+    /// Compile-time subsystem identifier for this runtime instance when running in a
+    /// multi-Copper deployment.
+    pub fn subsystem_id(&self) -> Option<&str> {
+        self.subsystem_id.as_deref()
+    }
+
+    /// Deployment/runtime instance identity for this runtime instance.
+    pub fn instance_id(&self) -> u32 {
+        self.instance_id
     }
 
     /// Canonical table of monitored runtime components.
@@ -667,6 +709,16 @@ impl CuMonitoringMetadata {
         self.monitor_config = monitor_config;
         self
     }
+
+    pub fn with_subsystem_id(mut self, subsystem_id: Option<&str>) -> Self {
+        self.subsystem_id = subsystem_id.map(CompactString::from);
+        self
+    }
+
+    pub fn with_instance_id(mut self, instance_id: u32) -> Self {
+        self.instance_id = instance_id;
+        self
+    }
 }
 
 /// Runtime-provided dynamic monitoring handles passed once to [`CuMonitor::new`].
@@ -678,10 +730,23 @@ pub struct CuMonitoringRuntime {
 }
 
 impl CuMonitoringRuntime {
+    #[cfg(feature = "std")]
+    pub fn new(execution_probe: MonitorExecutionProbe) -> Self {
+        ensure_runtime_panic_hook_installed();
+        Self { execution_probe }
+    }
+
+    #[cfg(not(feature = "std"))]
     pub const fn new(execution_probe: MonitorExecutionProbe) -> Self {
         Self { execution_probe }
     }
 
+    #[cfg(feature = "std")]
+    pub fn unavailable() -> Self {
+        Self::new(MonitorExecutionProbe::unavailable())
+    }
+
+    #[cfg(not(feature = "std"))]
     pub const fn unavailable() -> Self {
         Self::new(MonitorExecutionProbe::unavailable())
     }
@@ -689,6 +754,342 @@ impl CuMonitoringRuntime {
     pub fn execution_probe(&self) -> &MonitorExecutionProbe {
         &self.execution_probe
     }
+
+    #[cfg(feature = "std")]
+    pub fn register_panic_cleanup<F>(&self, callback: F) -> PanicHookRegistration
+    where
+        F: Fn(&PanicReport) + Send + Sync + 'static,
+    {
+        ensure_runtime_panic_hook_installed();
+        register_panic_cleanup(callback)
+    }
+
+    #[cfg(feature = "std")]
+    pub fn register_panic_action<F>(&self, callback: F) -> PanicHookRegistration
+    where
+        F: Fn(&PanicReport) -> Option<i32> + Send + Sync + 'static,
+    {
+        ensure_runtime_panic_hook_installed();
+        register_panic_action(callback)
+    }
+}
+
+#[cfg(feature = "std")]
+type PanicCleanupCallback = Arc<dyn Fn(&PanicReport) + Send + Sync + 'static>;
+#[cfg(feature = "std")]
+type PanicActionCallback = Arc<dyn Fn(&PanicReport) -> Option<i32> + Send + Sync + 'static>;
+
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct PanicReport {
+    message: String,
+    location: Option<String>,
+    thread_name: Option<String>,
+    backtrace: String,
+    timestamp_unix_ms: u128,
+    crash_report_path: Option<String>,
+}
+
+#[cfg(feature = "std")]
+impl PanicReport {
+    fn capture(info: &PanicHookInfo<'_>) -> Self {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
+        let thread_name = std::thread::current().name().map(|name| name.to_string());
+        let timestamp_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_millis())
+            .unwrap_or(0);
+
+        Self {
+            message: panic_hook_payload_to_string(info),
+            location,
+            thread_name,
+            backtrace: Backtrace::force_capture().to_string(),
+            timestamp_unix_ms,
+            crash_report_path: None,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn location(&self) -> Option<&str> {
+        self.location.as_deref()
+    }
+
+    pub fn thread_name(&self) -> Option<&str> {
+        self.thread_name.as_deref()
+    }
+
+    pub fn backtrace(&self) -> &str {
+        &self.backtrace
+    }
+
+    pub fn timestamp_unix_ms(&self) -> u128 {
+        self.timestamp_unix_ms
+    }
+
+    pub fn crash_report_path(&self) -> Option<&str> {
+        self.crash_report_path.as_deref()
+    }
+
+    pub fn summary(&self) -> String {
+        match self.location() {
+            Some(location) => format!("panic at {location}: {}", self.message()),
+            None => format!("panic: {}", self.message()),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanicHookRegistrationKind {
+    Cleanup,
+    Action,
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct RegisteredPanicCleanup {
+    id: usize,
+    callback: PanicCleanupCallback,
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct RegisteredPanicAction {
+    id: usize,
+    callback: PanicActionCallback,
+}
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct PanicHookRegistry {
+    cleanup_callbacks: StdMutex<Vec<RegisteredPanicCleanup>>,
+    action_callbacks: StdMutex<Vec<RegisteredPanicAction>>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct PanicHookRegistration {
+    id: usize,
+    kind: PanicHookRegistrationKind,
+}
+
+#[cfg(feature = "std")]
+impl Drop for PanicHookRegistration {
+    fn drop(&mut self) {
+        unregister_panic_hook(self.kind, self.id);
+    }
+}
+
+#[cfg(feature = "std")]
+static PANIC_HOOK_REGISTRY: OnceLock<PanicHookRegistry> = OnceLock::new();
+#[cfg(feature = "std")]
+static PANIC_HOOK_INSTALL_ONCE: OnceLock<()> = OnceLock::new();
+#[cfg(feature = "std")]
+static PANIC_HOOK_REGISTRATION_ID: AtomicUsize = AtomicUsize::new(1);
+#[cfg(feature = "std")]
+static PANIC_HOOK_ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "std")]
+fn panic_hook_registry() -> &'static PanicHookRegistry {
+    PANIC_HOOK_REGISTRY.get_or_init(PanicHookRegistry::default)
+}
+
+#[cfg(feature = "std")]
+fn ensure_runtime_panic_hook_installed() {
+    let _ = PANIC_HOOK_INSTALL_ONCE.get_or_init(|| {
+        std::panic::set_hook(Box::new(move |info| {
+            let _guard = PanicHookActiveGuard::new();
+            let mut report = PanicReport::capture(info);
+            run_panic_cleanup_callbacks(&report);
+            report.crash_report_path = write_panic_report_to_file(&report);
+            emit_panic_report(&report);
+
+            if let Some(exit_code) = run_panic_action_callbacks(&report) {
+                std::process::exit(exit_code);
+            }
+        }));
+    });
+}
+
+#[cfg(feature = "std")]
+struct PanicHookActiveGuard;
+
+#[cfg(feature = "std")]
+impl PanicHookActiveGuard {
+    fn new() -> Self {
+        PANIC_HOOK_ACTIVE_COUNT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for PanicHookActiveGuard {
+    fn drop(&mut self) {
+        PANIC_HOOK_ACTIVE_COUNT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "std")]
+pub fn runtime_panic_hook_active() -> bool {
+    PANIC_HOOK_ACTIVE_COUNT.load(Ordering::SeqCst) > 0
+}
+
+#[cfg(not(feature = "std"))]
+pub const fn runtime_panic_hook_active() -> bool {
+    false
+}
+
+#[cfg(feature = "std")]
+fn register_panic_cleanup<F>(callback: F) -> PanicHookRegistration
+where
+    F: Fn(&PanicReport) + Send + Sync + 'static,
+{
+    let id = PANIC_HOOK_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed);
+    let callback = Arc::new(callback) as PanicCleanupCallback;
+    let mut callbacks = panic_hook_registry()
+        .cleanup_callbacks
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    callbacks.push(RegisteredPanicCleanup { id, callback });
+    PanicHookRegistration {
+        id,
+        kind: PanicHookRegistrationKind::Cleanup,
+    }
+}
+
+#[cfg(feature = "std")]
+fn register_panic_action<F>(callback: F) -> PanicHookRegistration
+where
+    F: Fn(&PanicReport) -> Option<i32> + Send + Sync + 'static,
+{
+    let id = PANIC_HOOK_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed);
+    let callback = Arc::new(callback) as PanicActionCallback;
+    let mut callbacks = panic_hook_registry()
+        .action_callbacks
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    callbacks.push(RegisteredPanicAction { id, callback });
+    PanicHookRegistration {
+        id,
+        kind: PanicHookRegistrationKind::Action,
+    }
+}
+
+#[cfg(feature = "std")]
+fn unregister_panic_hook(kind: PanicHookRegistrationKind, id: usize) {
+    let registry = panic_hook_registry();
+    match kind {
+        PanicHookRegistrationKind::Cleanup => {
+            let mut callbacks = registry
+                .cleanup_callbacks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            callbacks.retain(|entry| entry.id != id);
+        }
+        PanicHookRegistrationKind::Action => {
+            let mut callbacks = registry
+                .action_callbacks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            callbacks.retain(|entry| entry.id != id);
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+fn run_panic_cleanup_callbacks(report: &PanicReport) {
+    let callbacks = panic_hook_registry()
+        .cleanup_callbacks
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    for entry in callbacks {
+        (entry.callback)(report);
+    }
+}
+
+#[cfg(feature = "std")]
+fn run_panic_action_callbacks(report: &PanicReport) -> Option<i32> {
+    let callbacks = panic_hook_registry()
+        .action_callbacks
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let mut exit_code = None;
+    for entry in callbacks {
+        if exit_code.is_none() {
+            exit_code = (entry.callback)(report);
+        } else {
+            let _ = (entry.callback)(report);
+        }
+    }
+    exit_code
+}
+
+#[cfg(feature = "std")]
+fn panic_hook_payload_to_string(info: &PanicHookInfo<'_>) -> String {
+    if let Some(msg) = info.payload().downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = info.payload().downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "panic with non-string payload".to_string()
+    }
+}
+
+#[cfg(feature = "std")]
+fn render_panic_report(report: &PanicReport) -> String {
+    let mut rendered = String::from("Copper panic\n");
+    rendered.push_str(&format!("time_unix_ms: {}\n", report.timestamp_unix_ms()));
+    rendered.push_str(&format!(
+        "thread: {}\n",
+        report.thread_name().unwrap_or("<unnamed>")
+    ));
+    if let Some(location) = report.location() {
+        rendered.push_str(&format!("location: {location}\n"));
+    }
+    rendered.push_str(&format!("message: {}\n", report.message()));
+    if let Some(path) = report.crash_report_path() {
+        rendered.push_str(&format!("crash_report: {path}\n"));
+    }
+    rendered.push_str("\nBacktrace:\n");
+    rendered.push_str(report.backtrace());
+    if !report.backtrace().ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
+}
+
+#[cfg(feature = "std")]
+fn emit_panic_report(report: &PanicReport) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(render_panic_report(report).as_bytes());
+    let _ = stderr.flush();
+}
+
+#[cfg(feature = "std")]
+fn write_panic_report_to_file(report: &PanicReport) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let file_name = format!(
+        "copper-crash-{}-{}.txt",
+        report.timestamp_unix_ms(),
+        std::process::id()
+    );
+    let path = cwd.join(file_name);
+    let path_string = path.to_string_lossy().to_string();
+    let mut file = File::create(&path).ok()?;
+    let mut report_with_path = report.clone();
+    report_with_path.crash_report_path = Some(path_string.clone());
+    file.write_all(render_panic_report(&report_with_path).as_bytes())
+        .ok()?;
+    file.flush().ok()?;
+    Some(path_string)
 }
 
 /// Monitor decision to be taken when a component step errored out.
@@ -751,9 +1152,16 @@ impl CopperListInfo {
 /// Reported data about CopperList IO for a single iteration.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CopperListIoStats {
-    /// CopperList struct size in RAM (excluding dynamic payloads/handles)
+    /// CopperList bytes resident in RAM for this iteration.
+    ///
+    /// This includes the fixed CopperList struct size plus any pooled or
+    /// handle-backed payload bytes observed on the real encode path.
     pub raw_culist_bytes: u64,
-    /// Bytes held by payloads that will be serialized (currently: pooled handles, vecs, slices)
+    /// Bytes attributed to handle-backed storage while measuring payload IO.
+    ///
+    /// This is surfaced separately so monitors can show how much of the runtime
+    /// footprint lives in pooled payload buffers rather than inside the fixed
+    /// CopperList struct.
     pub handle_bytes: u64,
     /// Bytes produced by bincode serialization of the CopperList
     pub encoded_culist_bytes: u64,
@@ -765,56 +1173,372 @@ pub struct CopperListIoStats {
     pub culistid: u64,
 }
 
-/// Lightweight trait to estimate the amount of data a payload will contribute when serialized.
-/// Default implementations return the stack size; specific types override to report dynamic data.
-pub trait CuPayloadSize {
-    /// Total bytes represented by the payload in memory (stack + heap backing).
-    fn raw_bytes(&self) -> usize {
-        core::mem::size_of_val(self)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadIoStats {
+    pub resident_bytes: usize,
+    pub encoded_bytes: usize,
+    pub handle_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CuMsgIoStats {
+    pub present: bool,
+    pub resident_bytes: u64,
+    pub encoded_bytes: u64,
+    pub handle_bytes: u64,
+}
+
+struct CuMsgIoEntry {
+    present: PortableAtomicBool,
+    resident_bytes: PortableAtomicU64,
+    encoded_bytes: PortableAtomicU64,
+    handle_bytes: PortableAtomicU64,
+}
+
+impl CuMsgIoEntry {
+    fn clear(&self) {
+        self.present.store(false, PortableOrdering::Release);
+        self.resident_bytes.store(0, PortableOrdering::Relaxed);
+        self.encoded_bytes.store(0, PortableOrdering::Relaxed);
+        self.handle_bytes.store(0, PortableOrdering::Relaxed);
     }
 
-    /// Bytes that correspond to reusable/pooled handles (used for IO budgeting).
-    fn handle_bytes(&self) -> usize {
-        0
+    fn get(&self) -> CuMsgIoStats {
+        if !self.present.load(PortableOrdering::Acquire) {
+            return CuMsgIoStats::default();
+        }
+
+        CuMsgIoStats {
+            present: true,
+            resident_bytes: self.resident_bytes.load(PortableOrdering::Relaxed),
+            encoded_bytes: self.encoded_bytes.load(PortableOrdering::Relaxed),
+            handle_bytes: self.handle_bytes.load(PortableOrdering::Relaxed),
+        }
+    }
+
+    fn set(&self, stats: CuMsgIoStats) {
+        self.resident_bytes
+            .store(stats.resident_bytes, PortableOrdering::Relaxed);
+        self.encoded_bytes
+            .store(stats.encoded_bytes, PortableOrdering::Relaxed);
+        self.handle_bytes
+            .store(stats.handle_bytes, PortableOrdering::Relaxed);
+        self.present.store(stats.present, PortableOrdering::Release);
     }
 }
 
-impl<T> CuPayloadSize for T
+impl Default for CuMsgIoEntry {
+    fn default() -> Self {
+        Self {
+            present: PortableAtomicBool::new(false),
+            resident_bytes: PortableAtomicU64::new(0),
+            encoded_bytes: PortableAtomicU64::new(0),
+            handle_bytes: PortableAtomicU64::new(0),
+        }
+    }
+}
+
+pub struct CuMsgIoCache<const N: usize> {
+    entries: [CuMsgIoEntry; N],
+}
+
+impl<const N: usize> CuMsgIoCache<N> {
+    pub fn clear(&self) {
+        for entry in &self.entries {
+            entry.clear();
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> CuMsgIoStats {
+        self.entries[idx].get()
+    }
+
+    fn raw_parts(&self) -> (usize, usize) {
+        (self.entries.as_ptr() as usize, N)
+    }
+}
+
+impl<const N: usize> Default for CuMsgIoCache<N> {
+    fn default() -> Self {
+        Self {
+            entries: core::array::from_fn(|_| CuMsgIoEntry::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActiveCuMsgIoCapture {
+    cache_addr: usize,
+    cache_len: usize,
+    current_slot: Option<usize>,
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static PAYLOAD_HANDLE_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+    static ACTIVE_COPPERLIST_CAPTURE: Cell<Option<ActiveCuMsgIoCapture>> = const { Cell::new(None) };
+    static LAST_COMPLETED_HANDLE_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(not(feature = "std"))]
+static PAYLOAD_HANDLE_BYTES: SpinMutex<Option<usize>> = SpinMutex::new(None);
+#[cfg(not(feature = "std"))]
+static ACTIVE_COPPERLIST_CAPTURE: SpinMutex<Option<ActiveCuMsgIoCapture>> = SpinMutex::new(None);
+#[cfg(not(feature = "std"))]
+static LAST_COMPLETED_HANDLE_BYTES: SpinMutex<u64> = SpinMutex::new(0);
+
+fn begin_payload_io_measurement() {
+    #[cfg(feature = "std")]
+    PAYLOAD_HANDLE_BYTES.with(|bytes| {
+        debug_assert!(
+            bytes.get().is_none(),
+            "payload IO byte measurement must not be nested"
+        );
+        bytes.set(Some(0));
+    });
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut bytes = PAYLOAD_HANDLE_BYTES.lock();
+        debug_assert!(
+            bytes.is_none(),
+            "payload IO byte measurement must not be nested"
+        );
+        *bytes = Some(0);
+    }
+}
+
+fn finish_payload_io_measurement() -> usize {
+    #[cfg(feature = "std")]
+    {
+        PAYLOAD_HANDLE_BYTES.with(|bytes| bytes.replace(None).unwrap_or(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        PAYLOAD_HANDLE_BYTES.lock().take().unwrap_or(0)
+    }
+}
+
+fn abort_payload_io_measurement() {
+    #[cfg(feature = "std")]
+    PAYLOAD_HANDLE_BYTES.with(|bytes| bytes.set(None));
+
+    #[cfg(not(feature = "std"))]
+    {
+        *PAYLOAD_HANDLE_BYTES.lock() = None;
+    }
+}
+
+fn current_payload_io_measurement() -> usize {
+    #[cfg(feature = "std")]
+    {
+        PAYLOAD_HANDLE_BYTES.with(|bytes| bytes.get().unwrap_or(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        PAYLOAD_HANDLE_BYTES.lock().as_ref().copied().unwrap_or(0)
+    }
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn record_payload_handle_bytes(bytes: usize) {
+    #[cfg(feature = "std")]
+    PAYLOAD_HANDLE_BYTES.with(|total| {
+        if let Some(current) = total.get() {
+            total.set(Some(current.saturating_add(bytes)));
+        }
+    });
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut total = PAYLOAD_HANDLE_BYTES.lock();
+        if let Some(current) = *total {
+            *total = Some(current.saturating_add(bytes));
+        }
+    }
+}
+
+fn set_last_completed_handle_bytes(bytes: u64) {
+    #[cfg(feature = "std")]
+    LAST_COMPLETED_HANDLE_BYTES.with(|total| total.set(bytes));
+
+    #[cfg(not(feature = "std"))]
+    {
+        *LAST_COMPLETED_HANDLE_BYTES.lock() = bytes;
+    }
+}
+
+pub fn take_last_completed_handle_bytes() -> u64 {
+    #[cfg(feature = "std")]
+    {
+        LAST_COMPLETED_HANDLE_BYTES.with(|total| total.replace(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut total = LAST_COMPLETED_HANDLE_BYTES.lock();
+        let value = *total;
+        *total = 0;
+        value
+    }
+}
+
+fn with_active_capture_mut<R>(f: impl FnOnce(&mut ActiveCuMsgIoCapture) -> R) -> Option<R> {
+    #[cfg(feature = "std")]
+    {
+        ACTIVE_COPPERLIST_CAPTURE.with(|capture| {
+            let mut state = capture.get()?;
+            let result = f(&mut state);
+            capture.set(Some(state));
+            Some(result)
+        })
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut capture = ACTIVE_COPPERLIST_CAPTURE.lock();
+        let state = capture.as_mut()?;
+        Some(f(state))
+    }
+}
+
+pub struct CuMsgIoCaptureGuard;
+
+impl CuMsgIoCaptureGuard {
+    pub fn select_slot(&self, slot: usize) {
+        let _ = with_active_capture_mut(|capture| {
+            debug_assert!(slot < capture.cache_len, "payload IO slot out of range");
+            capture.current_slot = Some(slot);
+        });
+    }
+}
+
+impl Drop for CuMsgIoCaptureGuard {
+    fn drop(&mut self) {
+        set_last_completed_handle_bytes(finish_payload_io_measurement() as u64);
+
+        #[cfg(feature = "std")]
+        ACTIVE_COPPERLIST_CAPTURE.with(|capture| capture.set(None));
+
+        #[cfg(not(feature = "std"))]
+        {
+            *ACTIVE_COPPERLIST_CAPTURE.lock() = None;
+        }
+    }
+}
+
+pub fn start_copperlist_io_capture<const N: usize>(cache: &CuMsgIoCache<N>) -> CuMsgIoCaptureGuard {
+    cache.clear();
+    set_last_completed_handle_bytes(0);
+    begin_payload_io_measurement();
+    let (cache_addr, cache_len) = cache.raw_parts();
+    let capture = ActiveCuMsgIoCapture {
+        cache_addr,
+        cache_len,
+        current_slot: None,
+    };
+
+    #[cfg(feature = "std")]
+    ACTIVE_COPPERLIST_CAPTURE.with(|state| {
+        debug_assert!(
+            state.get().is_none(),
+            "CopperList payload IO capture must not be nested"
+        );
+        state.set(Some(capture));
+    });
+
+    #[cfg(not(feature = "std"))]
+    {
+        let mut state = ACTIVE_COPPERLIST_CAPTURE.lock();
+        debug_assert!(
+            state.is_none(),
+            "CopperList payload IO capture must not be nested"
+        );
+        *state = Some(capture);
+    }
+
+    CuMsgIoCaptureGuard
+}
+
+pub(crate) fn current_payload_handle_bytes() -> usize {
+    current_payload_io_measurement()
+}
+
+pub(crate) fn record_current_slot_payload_io_stats(
+    fixed_bytes: usize,
+    encoded_bytes: usize,
+    handle_bytes: usize,
+) {
+    let _ = with_active_capture_mut(|capture| {
+        let Some(slot) = capture.current_slot else {
+            return;
+        };
+        if slot >= capture.cache_len {
+            return;
+        }
+        // SAFETY: the capture guard holds the cache alive for the duration of the encode pass.
+        let cache_ptr = capture.cache_addr as *const CuMsgIoEntry;
+        let entry = unsafe { &*cache_ptr.add(slot) };
+        entry.set(CuMsgIoStats {
+            present: true,
+            resident_bytes: (fixed_bytes.saturating_add(handle_bytes)) as u64,
+            encoded_bytes: encoded_bytes as u64,
+            handle_bytes: handle_bytes as u64,
+        });
+    });
+}
+
+/// Measures payload bytes using the same encode path Copper uses for
+/// logging/export.
+///
+/// `resident_bytes` is the payload's in-memory fixed footprint plus any
+/// handle-backed dynamic storage reported during encoding. `encoded_bytes` is
+/// the exact bincode payload size.
+pub fn payload_io_stats<T>(payload: &T) -> CuResult<PayloadIoStats>
 where
-    T: crate::cutask::CuMsgPayload,
+    T: Encode,
 {
-    fn raw_bytes(&self) -> usize {
-        core::mem::size_of::<T>()
-    }
-}
+    begin_payload_io_measurement();
+    begin_observed_encode();
 
-#[derive(Default, Debug, Clone, Copy)]
-struct NodeIoUsage {
-    has_incoming: bool,
-    has_outgoing: bool,
+    let result = (|| {
+        let mut encoder =
+            EncoderImpl::<_, _>::new(ObservedWriter::new(SizeWriter::default()), standard());
+        payload.encode(&mut encoder).map_err(|e| {
+            CuError::from("Failed to measure payload IO bytes").add_cause(&e.to_string())
+        })?;
+        let encoded_bytes = encoder.into_writer().into_inner().bytes_written;
+        debug_assert_eq!(encoded_bytes, finish_observed_encode());
+        let handle_bytes = finish_payload_io_measurement();
+        Ok(PayloadIoStats {
+            resident_bytes: core::mem::size_of::<T>().saturating_add(handle_bytes),
+            encoded_bytes,
+            handle_bytes,
+        })
+    })();
+
+    if result.is_err() {
+        abort_payload_io_measurement();
+        abort_observed_encode();
+    }
+
+    result
 }
 
 fn collect_output_ports(graph: &CuGraph, node_id: NodeId) -> Vec<(String, String)> {
-    let mut edge_ids = graph.get_src_edges(node_id).unwrap_or_default();
-    edge_ids.sort();
+    let Ok(msg_types) = graph.get_node_output_msg_types_by_id(node_id) else {
+        return Vec::new();
+    };
 
     let mut outputs = Vec::new();
-    let mut seen = Vec::new();
-    let mut port_idx = 0usize;
-    for edge_id in edge_ids {
-        let Some(edge) = graph.edge(edge_id) else {
-            continue;
-        };
-        if seen.iter().any(|msg| msg == &edge.msg) {
-            continue;
-        }
-        seen.push(edge.msg.clone());
+    for (port_idx, msg) in msg_types.into_iter().enumerate() {
         let mut port_label = String::from("out");
         port_label.push_str(&port_idx.to_string());
         port_label.push_str(": ");
-        port_label.push_str(edge.msg.as_str());
-        outputs.push((edge.msg.clone(), port_label));
-        port_idx += 1;
+        port_label.push_str(msg.as_str());
+        outputs.push((msg, port_label));
     }
     outputs
 }
@@ -823,7 +1547,6 @@ fn collect_output_ports(graph: &CuGraph, node_id: NodeId) -> Vec<(String, String
 pub fn build_monitor_topology(config: &CuConfig, mission: &str) -> CuResult<MonitorTopology> {
     let graph = config.get_graph(Some(mission))?;
     let mut nodes: Map<String, MonitorNode> = Map::new();
-    let mut io_usage: Map<String, NodeIoUsage> = Map::new();
     let mut output_port_lookup: Map<String, Map<String, String>> = Map::new();
 
     let mut bridge_lookup: Map<&str, &BridgeConfig> = Map::new();
@@ -831,40 +1554,31 @@ pub fn build_monitor_topology(config: &CuConfig, mission: &str) -> CuResult<Moni
         bridge_lookup.insert(bridge.id.as_str(), bridge);
     }
 
-    for cnx in graph.edges() {
-        io_usage.entry(cnx.src.clone()).or_default().has_outgoing = true;
-        io_usage.entry(cnx.dst.clone()).or_default().has_incoming = true;
-    }
-
-    for (_, node) in graph.get_all_nodes() {
+    for (node_idx, node) in graph.get_all_nodes() {
         let node_id = node.get_id();
-        let usage = io_usage.get(node_id.as_str()).cloned().unwrap_or_default();
-        let kind = match node.get_flavor() {
+        let task_kind = match node.get_flavor() {
             Flavor::Bridge => ComponentType::Bridge,
-            _ if !usage.has_incoming && usage.has_outgoing => ComponentType::Source,
-            _ if usage.has_incoming && !usage.has_outgoing => ComponentType::Sink,
-            _ => ComponentType::Task,
+            Flavor::Task => match resolve_task_kind_for_id(graph, node_idx)? {
+                TaskKind::Source => ComponentType::Source,
+                TaskKind::Regular => ComponentType::Task,
+                TaskKind::Sink => ComponentType::Sink,
+            },
         };
 
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
-        if kind == ComponentType::Bridge {
-            if let Some(bridge) = bridge_lookup.get(node_id.as_str()) {
-                for ch in &bridge.channels {
-                    match ch {
-                        BridgeChannelConfigRepresentation::Rx { id, .. } => {
-                            outputs.push(id.clone())
-                        }
-                        BridgeChannelConfigRepresentation::Tx { id, .. } => inputs.push(id.clone()),
-                    }
+        if task_kind == ComponentType::Bridge
+            && let Some(bridge) = bridge_lookup.get(node_id.as_str())
+        {
+            for ch in &bridge.channels {
+                match ch {
+                    BridgeChannelConfigRepresentation::Rx { id, .. } => outputs.push(id.clone()),
+                    BridgeChannelConfigRepresentation::Tx { id, .. } => inputs.push(id.clone()),
                 }
             }
         } else {
-            if usage.has_incoming || !usage.has_outgoing {
-                inputs.push("in".to_string());
-            }
-            if usage.has_outgoing {
-                if let Some(node_idx) = graph.get_node_id_by_name(node_id.as_str()) {
+            match task_kind {
+                ComponentType::Source => {
                     let ports = collect_output_ports(graph, node_idx);
                     let mut port_map: Map<String, String> = Map::new();
                     for (msg_type, label) in ports {
@@ -873,8 +1587,20 @@ pub fn build_monitor_topology(config: &CuConfig, mission: &str) -> CuResult<Moni
                     }
                     output_port_lookup.insert(node_id.clone(), port_map);
                 }
-            } else if !usage.has_incoming {
-                outputs.push("out".to_string());
+                ComponentType::Task => {
+                    inputs.push("in".to_string());
+                    let ports = collect_output_ports(graph, node_idx);
+                    let mut port_map: Map<String, String> = Map::new();
+                    for (msg_type, label) in ports {
+                        port_map.insert(msg_type, label.clone());
+                        outputs.push(label);
+                    }
+                    output_port_lookup.insert(node_id.clone(), port_map);
+                }
+                ComponentType::Sink => {
+                    inputs.push("in".to_string());
+                }
+                ComponentType::Bridge => unreachable!("handled above"),
             }
         }
 
@@ -883,7 +1609,7 @@ pub fn build_monitor_topology(config: &CuConfig, mission: &str) -> CuResult<Moni
             MonitorNode {
                 id: node_id,
                 type_name: Some(node.get_type().to_string()),
-                kind,
+                kind: task_kind,
                 inputs,
                 outputs,
             },
@@ -1004,7 +1730,7 @@ impl CuMonitor for NoMonitor {
                 .collect();
 
             if let Ok(msg) = format_message_only(format_str, params.as_slice(), &named) {
-                let ts = format_timestamp(entry.time);
+                let ts = format_timestamp(entry.time.into());
                 println!("{} [{:?}] {}", ts, entry.level, msg);
             }
         });
@@ -1229,8 +1955,8 @@ pub struct LiveStatistics {
     buckets: [u64; BUCKET_COUNT],
     min_val: u64,
     max_val: u64,
-    sum: u64,
-    sum_sq: u64,
+    sum: u128,
+    sum_sq: u128,
     count: u64,
     max_value: u64,
 }
@@ -1348,8 +2074,9 @@ impl LiveStatistics {
         if value > self.max_val {
             self.max_val = value;
         }
-        self.sum += value;
-        self.sum_sq += value * value;
+        let value_u128 = value as u128;
+        self.sum += value_u128;
+        self.sum_sq += value_u128 * value_u128;
         self.count += 1;
 
         let bucket = self.value_to_bucket(value);
@@ -1599,6 +2326,19 @@ mod tests {
     }
 
     #[test]
+    fn test_duration_stats_large_samples_do_not_overflow() {
+        let mut stats = CuDurationStatistics::new(CuDuration(10_000_000_000));
+        stats.record(CuDuration(5_000_000_000));
+        stats.record(CuDuration(8_000_000_000));
+
+        assert_eq!(stats.min(), CuDuration(5_000_000_000));
+        assert_eq!(stats.max(), CuDuration(8_000_000_000));
+        assert_eq!(stats.mean(), CuDuration(6_500_000_000));
+        assert!(stats.stddev().as_nanos().abs_diff(1_500_000_000) <= 1);
+        assert_eq!(stats.jitter_mean(), CuDuration(3_000_000_000));
+    }
+
+    #[test]
     fn tuple_monitor_merges_contradictory_decisions_with_strictest_wins() {
         let err = CuError::from("boom");
 
@@ -1639,6 +2379,37 @@ mod tests {
         assert_eq!(monitors.1.copperlist_calls.load(Ordering::SeqCst), 1);
         assert_eq!(monitors.0.panic_calls.load(Ordering::SeqCst), 1);
         assert_eq!(monitors.1.panic_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn encoded_size<E: Encode>(value: &E) -> usize {
+        let mut encoder = EncoderImpl::<_, _>::new(SizeWriter::default(), standard());
+        value
+            .encode(&mut encoder)
+            .expect("size measurement encoder should not fail");
+        encoder.into_writer().bytes_written
+    }
+
+    #[test]
+    fn payload_io_stats_tracks_encode_path_size_for_plain_payloads() {
+        let payload = vec![1u8, 2, 3, 4];
+        let io = payload_io_stats(&payload).expect("payload IO measurement should succeed");
+
+        assert_eq!(io.encoded_bytes, encoded_size(&payload));
+        assert_eq!(io.resident_bytes, core::mem::size_of::<Vec<u8>>());
+        assert_eq!(io.handle_bytes, 0);
+    }
+
+    #[test]
+    fn payload_io_stats_tracks_handle_backed_storage() {
+        let payload = crate::pool::CuHandle::new_detached(vec![0u8; 32]);
+        let io = payload_io_stats(&payload).expect("payload IO measurement should succeed");
+
+        assert_eq!(io.encoded_bytes, encoded_size(&payload));
+        assert_eq!(
+            io.resident_bytes,
+            core::mem::size_of::<crate::pool::CuHandle<Vec<u8>>>() + 32
+        );
+        assert_eq!(io.handle_bytes, 32);
     }
 
     #[test]

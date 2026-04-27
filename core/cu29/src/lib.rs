@@ -25,6 +25,10 @@
 //! - `reflect`: reflection support for runtime and units types
 //! - `textlogs`: text logging derive support
 //! - `remote-debug`: remote debug transport support
+//! - `sysclock-perf`: use a host/system clock for runtime perf timing while keeping robot time for `tov` and `rate_target_hz`
+//! - `high-precision-limiter`: std-only hybrid sleep/spin loop limiter for tighter `rate_target_hz` cadence
+//! - `async-cl-io`: offload CopperList serialization/logging to a dedicated std thread
+//! - `parallel-rt`: prepare the runtime for a future multi-threaded deterministic executor
 //!
 //! ## Concepts behind Copper
 //!
@@ -46,15 +50,24 @@
 //! - `cu29_runtime::curuntime::CuRuntime`: the runtime that manages task execution.
 //! - `cu29_runtime::simulation`: This will explain how to hook up your tasks to a simulation environment.
 //!
+//! ## V1 API status
+//!
+//! The V1 public contract is defined in `docs/v1-api-surface.md`. The prelude is the
+//! canonical application import surface; lower-level modules remain addressable by
+//! module path when needed, but are not implicitly part of the prelude contract.
+//!
 //! Need help or want to show what you're building? Join
 //! [Discord](https://discord.gg/VkCG7Sb9Kw) and hop into the #general channel.
 //!
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#[cfg(all(feature = "parallel-rt", not(feature = "std")))]
+compile_error!("feature `parallel-rt` requires `std`");
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
 pub use cu29_derive::{bundle_resources, resources};
+pub use cu29_runtime::app;
 pub use cu29_runtime::config;
 pub use cu29_runtime::context;
 pub use cu29_runtime::copperlist;
@@ -65,14 +78,23 @@ pub use cu29_runtime::curuntime;
 pub use cu29_runtime::cutask;
 #[cfg(feature = "std")]
 pub use cu29_runtime::debug;
+#[cfg(feature = "std")]
+pub use cu29_runtime::distributed_replay;
 pub use cu29_runtime::input_msg;
+pub use cu29_runtime::logcodec;
 pub use cu29_runtime::monitoring;
 pub use cu29_runtime::output_msg;
+#[cfg(all(feature = "std", feature = "parallel-rt"))]
+pub use cu29_runtime::parallel_queue;
+#[cfg(all(feature = "std", feature = "parallel-rt"))]
+pub use cu29_runtime::parallel_rt;
 pub use cu29_runtime::payload;
 pub use cu29_runtime::reflect;
 pub use cu29_runtime::reflect as bevy_reflect;
 #[cfg(feature = "remote-debug")]
 pub use cu29_runtime::remote_debug;
+#[cfg(feature = "std")]
+pub use cu29_runtime::replay;
 pub use cu29_runtime::resource;
 pub use cu29_runtime::rx_channels;
 #[cfg(feature = "std")]
@@ -117,12 +139,16 @@ pub use bincode;
 pub use cu29_clock as clock;
 #[cfg(feature = "units")]
 pub use cu29_units as units;
+#[doc(hidden)]
+pub use serde;
 #[cfg(feature = "defmt")]
 pub mod defmt {
     pub use defmt::{debug, error, info, warn};
 }
 #[cfg(feature = "std")]
 pub use cu29_runtime::config::read_configuration;
+#[cfg(feature = "std")]
+pub use cu29_runtime::config::read_multi_configuration;
 pub use cu29_traits::*;
 
 #[cfg(feature = "std")]
@@ -181,27 +207,37 @@ macro_rules! defmt_error {
     ($($tt:tt)*) => {{}};
 }
 
+/// Canonical imports for Copper applications.
+///
+/// This module intentionally re-exports each stable application-facing group once.
+/// Runtime internals, remote-debug plumbing, and experimental executor APIs should
+/// be imported from their explicit module paths instead of from the prelude.
 pub mod prelude {
     pub use crate::bevy_reflect;
     #[cfg(feature = "units")]
     pub use crate::units;
     pub use crate::{defmt_debug, defmt_error, defmt_info, defmt_warn};
+    #[cfg(feature = "reflect")]
+    pub use bevy_reflect_derive::Reflect;
     #[cfg(feature = "signal-handler")]
     pub use ctrlc;
     pub use cu29_clock::*;
-    pub use cu29_derive::*; // includes resources! proc macro
+    pub use cu29_derive::*;
     pub use cu29_log::*;
-    pub use cu29_log::{
-        __cu29_defmt_debug, __cu29_defmt_error, __cu29_defmt_info, __cu29_defmt_warn,
-    };
     pub use cu29_log_derive::*;
     pub use cu29_log_runtime::*;
+    #[cfg(not(feature = "reflect"))]
+    pub use cu29_reflect_derive::Reflect;
+    pub use cu29_runtime::app;
     pub use cu29_runtime::app::*;
     pub use cu29_runtime::config::*;
     pub use cu29_runtime::context::*;
     pub use cu29_runtime::copperlist::*;
     pub use cu29_runtime::cubridge::*;
-    pub use cu29_runtime::curuntime::*;
+    pub use cu29_runtime::curuntime::{
+        CuRuntime, KeyFrame, RuntimeLifecycleConfigSource, RuntimeLifecycleEvent,
+        RuntimeLifecycleRecord, RuntimeLifecycleStackInfo,
+    };
     pub use cu29_runtime::cutask::*;
     #[cfg(feature = "std")]
     pub use cu29_runtime::debug::*;
@@ -209,6 +245,8 @@ pub mod prelude {
     pub use cu29_runtime::monitoring::*;
     pub use cu29_runtime::output_msg;
     pub use cu29_runtime::payload::*;
+    #[cfg(feature = "std")]
+    pub use cu29_runtime::pool::*;
     #[cfg(feature = "reflect")]
     pub use cu29_runtime::reflect::serde as reflect_serde;
     #[cfg(feature = "reflect")]
@@ -216,22 +254,26 @@ pub mod prelude {
         ReflectSerializer, SerializationData, TypedReflectSerializer,
     };
     pub use cu29_runtime::reflect::{
-        GetTypeRegistration, Reflect, ReflectTaskIntrospection, ReflectTypePath, TypeInfo,
-        TypePath, TypeRegistry, dump_type_registry_schema,
+        GetTypeRegistration, ReflectTaskIntrospection, ReflectTypePath, TypeInfo, TypePath,
+        TypeRegistry, dump_type_registry_schema,
     };
-    #[cfg(feature = "remote-debug")]
-    pub use cu29_runtime::remote_debug::*;
     pub use cu29_runtime::resource::*;
     pub use cu29_runtime::rx_channels;
     #[cfg(feature = "std")]
     pub use cu29_runtime::simulation::*;
     pub use cu29_runtime::tx_channels;
-    pub use cu29_runtime::*;
-    pub use cu29_traits::*;
+    pub use cu29_traits::{
+        COMPACT_STRING_CAPACITY, CopperListTuple, CuCompactString, CuError, CuMsgMetadataTrait,
+        CuMsgOrigin, CuPayloadRawBytes, CuResult, DebugFieldDescriptor, DebugFieldKind,
+        DebugFieldSemantics, DebugScalarRegistration, DebugScalarType, ErasedCuStampedData,
+        ErasedCuStampedDataSet, MatchingTasks, Metadata, ObservedWriter, PayloadSchemas,
+        TaskOutputSpec, UnifiedLogType, WriteStream, abort_observed_encode, begin_observed_encode,
+        finish_observed_encode, observed_encode_bytes, record_observed_encode_bytes, with_cause,
+    };
+    #[cfg(feature = "std")]
+    pub use cu29_unifiedlog::memmap;
     pub use cu29_unifiedlog::*;
     pub use cu29_value::Value;
     pub use cu29_value::to_value;
-    #[cfg(feature = "std")]
-    pub use pool::*;
-    pub use serde::Serialize;
+    pub use serde_derive::{Deserialize, Serialize};
 }

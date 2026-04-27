@@ -1,7 +1,6 @@
 use cu29::prelude::*;
-use cu29_helpers::basic_copper_setup;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub mod tasks {
     use cu29::prelude::*;
@@ -75,27 +74,6 @@ pub mod tasks {
             Ok(())
         }
     }
-
-    #[derive(Reflect)]
-    pub struct ExampleSink;
-
-    impl Freezable for ExampleSink {}
-
-    impl CuSinkTask for ExampleSink {
-        type Resources<'r> = ();
-        type Input<'m> = input_msg!(i32);
-
-        fn new(_config: Option<&ComponentConfig>, _resources: Self::Resources<'_>) -> CuResult<Self>
-        where
-            Self: Sized,
-        {
-            Ok(Self)
-        }
-
-        fn process(&mut self, _ctx: &CuContext, _input: &Self::Input<'_>) -> CuResult<()> {
-            Ok(())
-        }
-    }
 }
 
 #[copper_runtime(config = "copperconfig.ron")]
@@ -109,15 +87,14 @@ fn main() {
     {
         fs::create_dir_all(parent).expect("Failed to create logs directory");
     }
-    let copper_ctx = basic_copper_setup(&PathBuf::from(logger_path), SLAB_SIZE, true, None)
-        .expect("Failed to setup logger.");
-
     debug!("Logger created at {}.", path = &logger_path);
-    let clock = copper_ctx.clock;
     debug!("Creating application... ");
-    let mut application = App::new(clock.clone(), copper_ctx.unified_logger.clone(), None)
+    let mut application = App::builder()
+        .with_log_path(logger_path, SLAB_SIZE)
+        .expect("Failed to setup logger.")
+        .build()
         .expect("Failed to create application.");
-    debug!("Running... starting clock: {}.", clock.now());
+    debug!("Running... starting clock: {}.", application.clock().now());
     application
         .start_all_tasks()
         .expect("Failed to start application.");
@@ -125,6 +102,6 @@ fn main() {
     application
         .stop_all_tasks()
         .expect("Failed to stop application.");
-    debug!("End of program: {}.", clock.now());
+    debug!("End of program: {}.", application.clock().now());
     // check if the logger file is at least 1 section in length
 }

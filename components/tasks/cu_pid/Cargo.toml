@@ -4,11 +4,17 @@ description = "A PID controller for the Copper project."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
+
+[package.metadata.copper]
+kind = "task"
+domains = ["algorithm/control"]
+environments = ["host", "embedded"]
 
 [features]
 default = ["std"]
@@ -17,6 +23,6 @@ textlogs = ["cu29/textlogs"]
 reflect = ["cu29/reflect"]
 
 [dependencies]
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false }
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false }
 bincode = { workspace = true }
 serde = { workspace = true }

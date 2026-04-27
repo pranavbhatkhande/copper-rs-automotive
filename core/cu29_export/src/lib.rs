@@ -1,3 +1,18 @@
+//! Log export helpers for Copper applications.
+//!
+//! This crate serves two related use cases:
+//!
+//! - Rust logreader binaries built with [`run_cli`]
+//! - optional Python-facing iterators for offline analysis of structured logs,
+//!   runtime lifecycle records, and app-specific CopperLists
+//!
+//! Python support here is intentionally offline. It reads data that Copper has
+//! already recorded. That is very different from putting Python on the runtime
+//! execution path, and it does not compromise realtime behavior during robot
+//! execution.
+//!
+//! For runtime Python task prototyping, see `cu-python-task` instead.
+
 mod fsck;
 pub mod logstats;
 
@@ -34,29 +49,40 @@ pub use mcap_export::{
 #[cfg(feature = "mcap")]
 pub use serde_to_jsonschema::trace_type_to_jsonschema;
 
-#[cfg(all(feature = "python", not(target_os = "macos")))]
+/// Registers the typed CopperList decoder used by the generic Python iterator.
+///
+/// Applications normally call this indirectly through
+/// [`copperlist_iterator_unified_typed_py`].
+#[cfg(feature = "python")]
 pub use python::register_copperlist_python_type;
 
 /// Creates a Python CopperList iterator for a specific CopperList tuple type.
 ///
 /// This is intended for app-specific Python modules that know their generated
-/// CopperList type at compile time.
-#[cfg(all(feature = "python", not(target_os = "macos")))]
+/// CopperList type at compile time. The helper registers the decoder and returns
+/// an iterator object that yields Python objects built from the recorded
+/// CopperLists.
+#[cfg(feature = "python")]
 pub fn copperlist_iterator_unified_typed_py<P>(
     unified_src_path: &str,
     py: pyo3::Python<'_>,
 ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>>
 where
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
 {
+    let _ = cu29::logcodec::seed_effective_config_from_log::<P>(Path::new(unified_src_path))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     register_copperlist_python_type::<P>()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let iter = python::copperlist_iterator_unified(unified_src_path)?;
     pyo3::Py::new(py, iter).map(|obj| obj.into())
 }
 
-/// Creates a Python RuntimeLifecycle iterator from a unified log.
-#[cfg(all(feature = "python", not(target_os = "macos")))]
+/// Creates a Python `RuntimeLifecycleRecord` iterator from a unified log.
+///
+/// This is useful for offline analysis scripts that need to inspect mission
+/// starts, stops, faults, and related runtime events.
+#[cfg(feature = "python")]
 pub fn runtime_lifecycle_iterator_unified_py(
     unified_src_path: &str,
     py: pyo3::Python<'_>,
@@ -177,9 +203,9 @@ fn build_read_logger(unifiedlog_base: &Path) -> CuResult<UnifiedLoggerRead> {
 #[cfg(feature = "mcap")]
 pub fn run_cli<P>() -> CuResult<()>
 where
-    P: CopperListTuple + CuPayloadRawBytes + mcap_export::PayloadSchemas,
+    P: CopperListTuple + CuPayloadRawBytes + mcap_export::PayloadSchemas + 'static,
 {
-    #[cfg(all(feature = "python", not(target_os = "macos")))]
+    #[cfg(feature = "python")]
     let _ = python::register_copperlist_python_type::<P>();
 
     run_cli_inner::<P>()
@@ -190,9 +216,9 @@ where
 #[cfg(not(feature = "mcap"))]
 pub fn run_cli<P>() -> CuResult<()>
 where
-    P: CopperListTuple + CuPayloadRawBytes,
+    P: CopperListTuple + CuPayloadRawBytes + 'static,
 {
-    #[cfg(all(feature = "python", not(target_os = "macos")))]
+    #[cfg(feature = "python")]
     let _ = python::register_copperlist_python_type::<P>();
 
     run_cli_inner::<P>()
@@ -201,10 +227,11 @@ where
 #[cfg(feature = "mcap")]
 fn run_cli_inner<P>() -> CuResult<()>
 where
-    P: CopperListTuple + CuPayloadRawBytes + mcap_export::PayloadSchemas,
+    P: CopperListTuple + CuPayloadRawBytes + mcap_export::PayloadSchemas + 'static,
 {
     let args = LogReaderCli::parse();
     let unifiedlog_base = args.unifiedlog_base;
+    let _ = cu29::logcodec::seed_effective_config_from_log::<P>(&unifiedlog_base)?;
 
     let mut dl = build_read_logger(&unifiedlog_base)?;
 
@@ -317,10 +344,11 @@ where
 #[cfg(not(feature = "mcap"))]
 fn run_cli_inner<P>() -> CuResult<()>
 where
-    P: CopperListTuple + CuPayloadRawBytes,
+    P: CopperListTuple + CuPayloadRawBytes + 'static,
 {
     let args = LogReaderCli::parse();
     let unifiedlog_base = args.unifiedlog_base;
+    let _ = cu29::logcodec::seed_effective_config_from_log::<P>(&unifiedlog_base)?;
 
     let mut dl = build_read_logger(&unifiedlog_base)?;
 
@@ -592,8 +620,8 @@ pub fn textlog_dump(src: impl Read, index: &Path) -> CuResult<()> {
     Ok(())
 }
 
-// only for users opting into python interface, not supported on macOS at the moment
-#[cfg(all(feature = "python", not(target_os = "macos")))]
+// Only compiled for users opting into the Python interface.
+#[cfg(feature = "python")]
 mod python {
     use bincode::config::standard;
     use bincode::decode_from_std_read;
@@ -612,28 +640,36 @@ mod python {
         for<'py> fn(&mut Box<dyn Read + Send + Sync>, Python<'py>) -> Option<PyResult<Py<PyAny>>>;
     static COPPERLIST_DECODER: OnceLock<CopperListDecodeFn> = OnceLock::new();
 
+    /// Iterator over structured Copper log entries.
     #[pyclass]
     pub struct PyLogIterator {
         reader: Box<dyn Read + Send + Sync>,
     }
 
+    /// Iterator over application-specific CopperLists decoded into Python values.
     #[pyclass]
     pub struct PyCopperListIterator {
         reader: Box<dyn Read + Send + Sync>,
         decode_next: CopperListDecodeFn,
     }
 
+    /// Iterator over runtime lifecycle records stored in a unified log.
     #[pyclass]
     pub struct PyRuntimeLifecycleIterator {
         reader: Box<dyn Read + Send + Sync>,
     }
 
+    /// Helper wrapper used when reflected unit-bearing values are exposed to Python.
     #[pyclass(get_all)]
     pub struct PyUnitValue {
         pub value: f64,
         pub unit: String,
     }
 
+    /// Register the Python decoder for one concrete CopperList tuple type.
+    ///
+    /// App-specific extension modules call this once before constructing a
+    /// `PyCopperListIterator`.
     pub fn register_copperlist_python_type<P>() -> CuResult<()>
     where
         P: CopperListTuple,
@@ -693,9 +729,11 @@ mod python {
             Some(runtime_lifecycle_record_to_py(&entry, py))
         }
     }
-    /// Creates an iterator of CuLogEntries from a bare binary structured log file (ie. not within a unified log).
-    /// This is mainly used for using the structured logging out of the Copper framework.
-    /// it returns a tuple with the iterator of log entries and the list of interned strings.
+    /// Create an iterator over structured log entries from a bare structured log file.
+    ///
+    /// This is the non-unified-log path used by standalone structured log setups.
+    /// The function returns the iterator together with the interned string table
+    /// needed to format each message.
     #[pyfunction]
     pub fn struct_log_iterator_bare(
         bare_struct_src_path: &str,
@@ -712,9 +750,10 @@ mod python {
             all_strings,
         ))
     }
-    /// Creates an iterator of CuLogEntries from a unified log file.
-    /// This function allows you to easily use python to datamind Copper's structured text logs.
-    /// it returns a tuple with the iterator of log entries and the list of interned strings.
+    /// Create an iterator over structured log entries from a unified log file.
+    ///
+    /// The function returns the iterator together with the interned string table
+    /// needed to rebuild the text messages.
     #[pyfunction]
     pub fn struct_log_iterator_unified(
         unified_src_path: &str,
@@ -745,7 +784,8 @@ mod python {
         ))
     }
 
-    /// Creates an iterator over CopperLists from a unified log file.
+    /// Create an iterator over CopperLists from a unified log file.
+    ///
     /// The concrete CopperList tuple type must be registered from Rust first with
     /// `register_copperlist_python_type::<P>()`.
     #[pyfunction]
@@ -777,7 +817,7 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
         })
     }
 
-    /// Creates an iterator over runtime lifecycle records from a unified log file.
+    /// Create an iterator over runtime lifecycle records from a unified log file.
     #[pyfunction]
     pub fn runtime_lifecycle_iterator_unified(
         unified_src_path: &str,
@@ -800,7 +840,7 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
             reader: Box::new(reader),
         })
     }
-    /// This is a python wrapper for CuLogEntries.
+    /// Python wrapper for [`CuLogEntry`].
     #[pyclass]
     pub struct PyCuLogEntry {
         pub inner: CuLogEntry,
@@ -808,7 +848,7 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
 
     #[pymethods]
     impl PyCuLogEntry {
-        /// Returns the timestamp of the log entry.
+        /// Return the timestamp of the log entry as a `datetime.timedelta`.
         pub fn ts<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
             let nanoseconds: u64 = self.inner.time.into();
 
@@ -820,17 +860,17 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
             PyDelta::new(py, days, seconds, microseconds, false)
         }
 
-        /// Returns the index of the message in the vector of interned strings.
+        /// Return the index of the message format string in the interned string table.
         pub fn msg_index(&self) -> u32 {
             self.inner.msg_index
         }
 
-        /// Returns the index of the parameter names in the vector of interned strings.
+        /// Return the indexes of the parameter names in the interned string table.
         pub fn paramname_indexes(&self) -> Vec<u32> {
             self.inner.paramname_indexes.iter().copied().collect()
         }
 
-        /// Returns the parameters of this log line
+        /// Return the structured parameters carried by this log line.
         pub fn params(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
             self.inner
                 .params
@@ -925,6 +965,9 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
                 stack_py.set_item("app_version", &stack.app_version)?;
                 stack_py.set_item("git_commit", &stack.git_commit)?;
                 stack_py.set_item("git_dirty", stack.git_dirty)?;
+                stack_py.set_item("subsystem_id", &stack.subsystem_id)?;
+                stack_py.set_item("subsystem_code", stack.subsystem_code)?;
+                stack_py.set_item("instance_id", stack.instance_id)?;
                 root.set_item("stack", dict_to_namespace(stack_py, py)?)?;
             }
             RuntimeLifecycleEvent::MissionStarted { mission } => {
@@ -976,6 +1019,15 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
         let metadata_py = PyDict::new(py);
         metadata_py.set_item("process_time", dict_to_namespace(process_time, py)?)?;
         metadata_py.set_item("status_txt", metadata.status_txt().0.to_string())?;
+        if let Some(origin) = metadata.origin() {
+            let origin_py = PyDict::new(py);
+            origin_py.set_item("subsystem_code", origin.subsystem_code)?;
+            origin_py.set_item("instance_id", origin.instance_id)?;
+            origin_py.set_item("cl_id", origin.cl_id)?;
+            metadata_py.set_item("origin", dict_to_namespace(origin_py, py)?)?;
+        } else {
+            metadata_py.set_item("origin", py.None())?;
+        }
         dict_to_namespace(metadata_py, py)
     }
 
@@ -1209,11 +1261,13 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
         downcast_copy!(u16);
         downcast_copy!(u32);
         downcast_copy!(u64);
+        downcast_copy!(u128);
         downcast_copy!(usize);
         downcast_copy!(i8);
         downcast_copy!(i16);
         downcast_copy!(i32);
         downcast_copy!(i64);
+        downcast_copy!(i128);
         downcast_copy!(isize);
         downcast_copy!(f32);
         downcast_copy!(f64);
@@ -1236,7 +1290,9 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
         match value {
             Value::String(s) => Ok(s.into_pyobject(py)?.into()),
             Value::U64(u) => Ok(u.into_pyobject(py)?.into()),
+            Value::U128(u) => Ok(u.into_pyobject(py)?.into()),
             Value::I64(i) => Ok(i.into_pyobject(py)?.into()),
+            Value::I128(i) => Ok(i.into_pyobject(py)?.into()),
             Value::F64(f) => Ok(f.into_pyobject(py)?.into()),
             Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into()),
             Value::CuTime(t) => Ok(t.0.into_pyobject(py)?.into()),
@@ -1270,6 +1326,25 @@ Call register_copperlist_python_type::<P>() from Rust before using this function
                 let list = PyList::new(py, items)?;
                 Ok(list.into_pyobject(py)?.into())
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn value_to_py_preserves_128_bit_integers() {
+            Python::initialize();
+            Python::attach(|py| {
+                let u128_value = u128::from(u64::MAX) + 99;
+                let u128_py = value_to_py(&Value::U128(u128_value), py).unwrap();
+                assert_eq!(u128_py.bind(py).extract::<u128>().unwrap(), u128_value);
+
+                let i128_value = i128::from(i64::MIN) - 99;
+                let i128_py = value_to_py(&Value::I128(i128_value), py).unwrap();
+                assert_eq!(i128_py.bind(py).extract::<i128>().unwrap(), i128_value);
+            });
         }
     }
 }
@@ -1425,6 +1500,9 @@ mod tests {
                         app_version: "0.1.0".to_string(),
                         git_commit: None,
                         git_dirty: None,
+                        subsystem_id: Some("ping".to_string()),
+                        subsystem_code: 7,
+                        instance_id: 42,
                     },
                 },
             },

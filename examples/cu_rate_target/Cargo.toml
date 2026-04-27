@@ -4,6 +4,7 @@ description = "Example showing how to set a runtime rate target for the Copper a
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -12,16 +13,27 @@ repository.workspace = true
 default-run = "rate-target"
 
 publish = false
-[dependencies]
-cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
-serde = { workspace = true }        # Keep
-cu29-export = { workspace = true }  # Keep
 
+[features]
+default = []
+high-precision-limiter = ["cu29/high-precision-limiter"]
+
+[dependencies]
+cu29 = { workspace = true, features = ["log-level-info"] }
+serde = { workspace = true }
+cu29-export = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "rate-target"
-path = "src/main.rs"
+path = "src/bin/rate_target.rs"
+
+[[bin]]
+name = "rate-target-precise"
+path = "src/bin/rate_target_precise.rs"
+required-features = ["high-precision-limiter"]
 
 [package.metadata.cargo-shear]
 ignored = ["serde", "cu29-export"]

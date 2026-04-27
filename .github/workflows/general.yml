@@ -13,14 +13,66 @@ env:
   CARGO_PROFILE_DEV_CODEGEN_UNITS: "16"
   CARGO_PROFILE_TEST_CODEGEN_UNITS: "16"
   CARGO_INCREMENTAL: "0"
+  MSRV: "1.95.0"
 
 jobs:
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    env:
+      WORKSPACE_SCOPE: workspace
+    steps:
+      - uses: actions/checkout@v6
+      - id: rust_ci_setup
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          toolchain: ${{ env.MSRV }}
+          linux_cargo_paths: true
+          cache_prefix: msrv
+          cache_shared_key: rust-ubuntu
+          install_nextest: "false"
+          sccache_key_suffix: msrv
+      - name: Detect embedded-only crates
+        run: |
+          EXCLUDES=$(python3 support/ci/embedded_crates.py excludes)
+          echo "EMBEDDED_EXCLUDES=$EXCLUDES" >> $GITHUB_ENV
+      - name: Check workspace on MSRV
+        run: cargo +${{ env.MSRV }} check --workspace --all-targets $EMBEDDED_EXCLUDES
+      - name: Check no_std default members on MSRV
+        run: cargo +${{ env.MSRV }} check --no-default-features
+
   Unit-Tests:
     name: Unit Tests
     uses: ./.github/workflows/reusable-unit-tests.yml
     with:
       toolchain: stable
       linux_cargo_paths: true
+
+  api:
+    name: Public API Check
+    runs-on: ubuntu-latest
+    env:
+      PUBLIC_API_VERSION: "0.51.0"
+      PUBLIC_API_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: api-check
+          shared-key: rust-ubuntu
+          cache-targets: "false"
+          cache-bin: "true"
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install cargo-public-api
+        run: |
+          if ! cargo +stable public-api --version 2>/dev/null | grep -qx "cargo-public-api ${PUBLIC_API_VERSION}"; then
+            cargo +stable install --locked cargo-public-api --version "${PUBLIC_API_VERSION}" --force
+          fi
+      - name: Check public API snapshots
+        run: support/ci/check_public_api.sh
+
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
@@ -34,7 +86,7 @@ jobs:
         with:
           tool: taplo-cli, fmtron, typos
       - name: Check Rust, TOML, RON formatting
-        uses: j178/prek-action@v1
+        uses: j178/prek-action@v2
         with:
           extra-args: >-
             --all-files

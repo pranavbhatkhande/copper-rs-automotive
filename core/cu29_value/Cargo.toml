@@ -4,6 +4,7 @@ description = "This is a fork of Value with custom types added for Copper like t
 
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
@@ -21,6 +22,7 @@ cu29-clock = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
 ordered-float = { version = "5.1", default-features = false }
+pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_derive = { workspace = true }
@@ -28,3 +30,4 @@ serde_derive = { workspace = true }
 [features]
 default = ["std"]
 std = ["ordered-float/std", "cu29-clock/std"]
+python = ["std", "dep:pyo3"]

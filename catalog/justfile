@@ -1,0 +1,41 @@
+ROOT := `git rev-parse --show-toplevel`
+
+# Generate the Copper component catalog from index.ron.
+default: generate
+
+# Generate the Copper component catalog from this directory.
+generate:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd "{{ROOT}}/catalog"
+	./build_generated.sh
+	xdg-open generated/catalog/index.html
+
+# Build the deployable catalog tree under catalog/generated, with generated as the CDN root.
+build-generated:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd "{{ROOT}}/catalog"
+	./build_generated.sh
+
+# Backwards-compatible alias for the deployable build.
+build-dist: build-generated
+
+# Build and publish the deployable catalog tree to Bunny Storage.
+deploy:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd "{{ROOT}}/catalog"
+	./build_generated.sh
+	./deploy_bunny_storage.sh
+
+# Build and preview the deployable catalog upload without touching Bunny.
+deploy-dry-run:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd "{{ROOT}}/catalog"
+	./build_generated.sh
+	BUNNY_DRY_RUN=true ./deploy_bunny_storage.sh
+
+# Backwards-compatible alias.
+catalog: generate

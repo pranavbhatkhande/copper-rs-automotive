@@ -4,11 +4,17 @@ description = "A simple generic rate limiter for Copper"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
+
+[package.metadata.copper]
+kind = "task"
+domains = ["algorithm/rate-control"]
+environments = ["host"]
 
 [dependencies]
 cu29 = { workspace = true }

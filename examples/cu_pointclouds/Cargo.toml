@@ -4,6 +4,7 @@ description = "This is small sink example to display a Copper pointcloud in reru
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -13,10 +14,9 @@ repository.workspace = true
 publish = false
 [dependencies]
 cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
 tempfile = { workspace = true }
-cu-hesai = { path = "../../components/sources/cu_hesai", version = "0.13.0" }
-cu-udp-inject = { path = "../../components/testing/cu_udp_inject", version = "0.13.0" }
+cu-hesai = { path = "../../components/sources/cu_hesai", version = "0.15.0" }
+cu-udp-inject = { path = "../../components/testing/cu_udp_inject", version = "0.15.0" }
 rerun = { workspace = true }
 serde = { workspace = true }
 

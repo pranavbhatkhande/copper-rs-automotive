@@ -4,6 +4,7 @@ description = "Copper resource bundle for the MicoAir H743 flight controller."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -11,8 +12,10 @@ homepage.workspace = true
 repository.workspace = true
 
 [package.metadata.copper]
-embedded_only = true
-embedded_target = "thumbv7em-none-eabihf"
+kind = "resource"
+domains = ["board/flight-controller", "resource/board-bundle"]
+environments = ["embedded"]
+embedded_targets = ["thumbv7em-none-eabihf"]
 
 [features]
 default = ["defmt"]
@@ -20,17 +23,17 @@ defmt = ["dep:defmt", "cu29/defmt", "cu-bdshot/defmt", "stm32h7xx-hal/defmt"]
 textlogs = ["cu29/textlogs", "cu-bdshot/textlogs", "cu-sdlogger/textlogs"]
 
 [dependencies]
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false }
-cu-dps310 = { path = "../../sources/cu_dps310", version = "0.13.0", default-features = false }
-cu-ist8310 = { path = "../../sources/cu_ist8310", version = "0.13.0", default-features = false }
-cu-bdshot = { path = "../../bridges/cu_bdshot", version = "0.13.0", default-features = false, features = [
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false }
+cu-dps310 = { path = "../../sources/cu_dps310", version = "0.15.0", default-features = false }
+cu-ist8310 = { path = "../../sources/cu_ist8310", version = "0.15.0", default-features = false }
+cu-bdshot = { path = "../../bridges/cu_bdshot", version = "0.15.0", default-features = false, features = [
   "stm32h7",
 ] }
-cu-sdlogger = { path = "../../libs/cu_sdlogger", version = "0.13.0" }
+cu-sdlogger = { path = "../../libs/cu_sdlogger", version = "0.15.0" }
 cortex-m = { workspace = true, features = ["critical-section-single-core"] }
 defmt = { workspace = true, optional = true }
 embedded-hal = { version = "0.2.7", default-features = false }
-embedded-io = { version = "0.6.1", default-features = false }
+embedded-io = { version = "0.7.1", default-features = false }
 spin = { workspace = true }
 stm32h7xx-hal = { workspace = true, default-features = false, features = [
   "stm32h743v",

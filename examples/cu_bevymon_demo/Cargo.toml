@@ -4,16 +4,18 @@ description = "Minimal side-by-side Bevy sim and Copper monitor demo."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
 default-run = "cu-bevymon-demo"
+publish = false
 
 [dependencies]
 bevy_ecs = { version = "0.18.0", default-features = false }
-cu29 = { path = "../../core/cu29", version = "0.13.0", default-features = false, features = [
+cu29 = { path = "../../core/cu29", version = "0.15.0", default-features = false, features = [
   "std",
   "textlogs",
 ] }
@@ -32,7 +34,9 @@ bevy = { workspace = true, default-features = false, features = [
   "bevy_ui",
   "bevy_ui_render",
 ] }
-cu-bevymon = { path = "../../components/monitors/cu_bevymon", version = "0.13.0" }
+cu-bevymon = { path = "../../components/monitors/cu_bevymon", version = "0.15.0" }
+image = { workspace = true, default-features = false, features = ["png"] }
+winit = { version = "=0.30.12", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy = { workspace = true, default-features = false, features = [
@@ -44,7 +48,7 @@ bevy = { workspace = true, default-features = false, features = [
   "bevy_ui",
   "bevy_ui_render",
 ] }
-cu-bevymon = { path = "../../components/monitors/cu_bevymon", version = "0.13.0", default-features = false }
+cu-bevymon = { path = "../../components/monitors/cu_bevymon", version = "0.15.0", default-features = false }
 
 [[bin]]
 name = "cu-bevymon-demo"

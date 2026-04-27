@@ -1,0 +1,23 @@
+(
+    resources: [
+        (
+            id: "threadpool",
+            provider: "cu29::resource::ThreadPoolBundle",
+            config: {"threads": 1},
+        ),
+    ],
+    tasks: [
+        (
+            id: "src",
+            type: "BackgroundSrc",
+            background: true,
+        ),
+    ],
+    cnx: [
+        (
+            src: "src",
+            dst: "__nc__",
+            msg: "u32",
+        ),
+    ],
+)

@@ -4,32 +4,29 @@ description = "A copper-rs bridge to communicate through CRSF. The initial motiv
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[package.metadata.copper]
+kind = "bridge"
+domains = ["control/radio", "protocol/crsf"]
+environments = ["host", "embedded"]
+
 [dependencies]
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false }
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false }
 crsf = "2.0.1"
-embedded-io-06 = { package = "embedded-io", version = "0.6.1", default-features = false, optional = true }
-embedded-io-07 = { package = "embedded-io", version = "0.7.1", default-features = false, optional = true }
+embedded-io = { version = "0.7.1", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true, features = ["alloc", "derive"] }
 cu-linux-resources = { workspace = true, optional = true }
 
-
 [features]
-default = ["std", "embedded-io-06"]
-embedded-io-06 = ["dep:embedded-io-06"]
-embedded-io-07 = ["dep:embedded-io-07"]
-std = [
-  "cu29/std",
-  "embedded-io-06",
-  "embedded-io-06/std",
-  "dep:cu-linux-resources",
-]
+default = ["std"]
+std = ["cu29/std", "embedded-io/std", "dep:cu-linux-resources"]
 defmt = ["cu29/defmt"]
 alloc = []
 textlogs = ["cu29/textlogs"]

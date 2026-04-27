@@ -1,8 +1,13 @@
 # CI-aligned helpers mirroring .github/workflows/general.yml
-BASE_FEATURES := "mock,image,kornia,gst,faer,nalgebra,glam,debug_pane,bincode,log-level-debug"
-WINDOWS_BASE_FEATURES := "mock,image,kornia,python,gst,faer,nalgebra,glam,debug_pane,bincode"
+BASE_FEATURES := "mock,cu-sensor-payloads/image,kornia,gst,faer,nalgebra,glam,debug_pane,bincode,log-level-debug"
+WINDOWS_BASE_FEATURES := "mock,cu-sensor-payloads/image,kornia,python,gst,faer,nalgebra,glam,debug_pane,bincode"
+MSRV := "1.95.0"
+PUBLIC_API_VERSION := "0.51.0"
+PUBLIC_API_TOOLCHAIN := "nightly"
 export ROOT := `git rev-parse --show-toplevel`
 EMBEDDED_EXCLUDES := shell('python3 $1/support/ci/embedded_crates.py excludes', ROOT)
+PREK_FMT_FIX_HOOKS := "trailing-whitespace mixed-line-ending"
+PREK_FMT_CHECK_HOOKS := "trailing-whitespace check-merge-conflict detect-private-key check-case-conflict check-added-large-files check-yaml check-json check-xml check-symlinks mixed-line-ending"
 
 # Default to the local PR-check workflow.
 default:
@@ -12,6 +17,7 @@ default:
 pr-check:
 	just fmt
 	just lint
+	just api-check
 	just test
 
 # Formatting, typo, and clippy checks.
@@ -21,21 +27,23 @@ lint:
 	just clippy-std
 	just clippy-nostd
 
-# Formatting check only
+# Formatting and CI-aligned file-hygiene check only
 fmt-check: check-format-tools
 	@cargo +stable fmt --all -- --check
 	@git ls-files -z '*.toml' | xargs -0 -r env RUST_LOG=warn taplo format --check
 	@bash -lc 'set -euo pipefail; changed=(); while IFS= read -r -d "" f; do tmp=$(mktemp); cp "$f" "$tmp"; fmtron --input "$tmp" >/dev/null; if ! cmp -s "$f" "$tmp"; then changed+=("$f"); fi; rm -f "$tmp"; done < <(git ls-files -z "*.ron" ":!examples/modular_config_example/motors.ron"); if ((${#changed[@]})); then printf "RON formatting check failed:\n"; printf "%s\n" "${changed[@]}"; exit 1; fi'
 	@rg --files -g '*.ron.bak' | xargs rm -f
+	@prek run --all-files {{PREK_FMT_CHECK_HOOKS}}
 
-# Apply formatting to Rust, TOML, and RON files
+# Apply formatting plus auto-fixable CI hygiene hooks
 fmt: check-format-tools
 	@cargo +stable fmt --all
 	@git ls-files -z '*.toml' | xargs -0 -r env RUST_LOG=warn taplo format >/dev/null
 	@git ls-files -z '*.ron' ':!examples/modular_config_example/motors.ron' | xargs -0 -r -n 1 fmtron --input>/dev/null
 	@rg --files -g '*.ron.bak' | xargs rm -f
+	@bash -lc 'set -euo pipefail; prek run --all-files {{PREK_FMT_FIX_HOOKS}} || prek run --all-files {{PREK_FMT_FIX_HOOKS}}'
 
-# Ensure the formatters needed by fmt/fmt-check are installed.
+# Ensure the tools needed by fmt/fmt-check are installed.
 check-format-tools:
 	#!/usr/bin/env bash
 	set -euo pipefail
@@ -47,6 +55,10 @@ check-format-tools:
 	fi
 	if ! command -v fmtron >/dev/null 2>&1; then
 		echo "Missing fmtron. Install with: cargo install --locked fmtron"
+		missing=1
+	fi
+	if ! command -v prek >/dev/null 2>&1; then
+		echo "Missing prek. Install with: cargo install --locked prek"
 		missing=1
 	fi
 	if ! command -v rg > /dev/null 2>&1; then
@@ -61,6 +73,29 @@ check-format-tools:
 typos:
 	typos -c .config/_typos.toml
 
+# Ensure public API snapshot tooling is available.
+check-public-api:
+	#!/usr/bin/env bash
+	set -euo pipefail
+
+	if ! rustup run {{PUBLIC_API_TOOLCHAIN}} rustc --version >/dev/null 2>&1; then
+		echo "Missing Rust {{PUBLIC_API_TOOLCHAIN}} toolchain required by cargo-public-api. Install with: rustup toolchain install {{PUBLIC_API_TOOLCHAIN}} --profile minimal"
+		exit 1
+	fi
+
+	if ! cargo +stable public-api --version 2>/dev/null | grep -qx "cargo-public-api {{PUBLIC_API_VERSION}}"; then
+		echo "Missing cargo-public-api {{PUBLIC_API_VERSION}}. Install with: cargo install --locked cargo-public-api --version {{PUBLIC_API_VERSION}}"
+		exit 1
+	fi
+
+# Check the V1 public API snapshot baseline.
+api-check: check-public-api
+	@support/ci/check_public_api.sh
+
+# Refresh the V1 public API snapshot baseline after an intentional API change.
+api-update: check-public-api
+	@UPDATE_PUBLIC_API=1 support/ci/check_public_api.sh
+
 # Std clippy checks aligned with reusable unit-test workflow defaults.
 clippy-std:
 	#!/usr/bin/env bash
@@ -70,7 +105,7 @@ clippy-std:
 	features="{{BASE_FEATURES}}"
 	case "$os" in
 		Linux*) features="{{BASE_FEATURES}},python" ;;
-		Darwin*) features="{{BASE_FEATURES}}" ;;
+		Darwin*) features="{{BASE_FEATURES}},python" ;;
 		MINGW*|MSYS*|CYGWIN*|Windows_NT) features="{{WINDOWS_BASE_FEATURES}}" ;;
 		*) features="{{BASE_FEATURES}}" ;;
 	esac
@@ -96,8 +131,19 @@ clippy-nostd:
 
 # Run std and no_std unit tests.
 test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+
 	cargo +stable nextest run --all-targets --workspace {{EMBEDDED_EXCLUDES}}
 	cargo +stable nextest run --no-default-features
+
+# Verify the declared minimum supported Rust version.
+msrv-check:
+	#!/usr/bin/env bash
+	set -euo pipefail
+
+	cargo +{{MSRV}} check --workspace --all-targets {{EMBEDDED_EXCLUDES}}
+	cargo +{{MSRV}} check --no-default-features
 
 # Run the no_std/embedded CI flow locally.
 nostd-ci:
@@ -129,7 +175,7 @@ std-ci mode="debug":
 	features="{{BASE_FEATURES}}"
 	case "$os" in
 		Linux*) features="{{BASE_FEATURES}},python" ;;
-		Darwin*) features="{{BASE_FEATURES}}" ;;
+		Darwin*) features="{{BASE_FEATURES}},python" ;;
 		MINGW*|MSYS*|CYGWIN*|Windows_NT) features="{{WINDOWS_BASE_FEATURES}}" ;;
 		*) features="{{BASE_FEATURES}}" ;;
 	esac
@@ -210,7 +256,13 @@ rtsan-smoke pkg="cu-caterpillar" bin="cu-caterpillar" args="" options="halt_on_e
 	RTSAN_ENABLE=1 RTSAN_OPTIONS="{{options}}" \
 		cargo run --profile screaming -p "{{pkg}}" --features rtsan --bin "{{bin}}" -- {{args}}
 
-# Project-specific helpers now live in per-directory justfiles under examples/, components/, and support/.
+# Project-specific helpers now live in per-directory justfiles under examples/, components/, support/, and catalog/.
+
+# Install hidden desktop entries so Wayland can map sim app_ids to the Copper icon.
+install-sim-desktop-entries:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	bash support/linux/install_sim_desktop_entries.sh "{{ROOT}}"
 
 # Build and open the generated wiki + API docs locally.
 docs:
@@ -339,7 +391,8 @@ extract-log dev out="logs/embedded_0.copper":
 	echo "Reading Cu29 partition $PART -> $OUT"
 	sudo dd if="$PART" of="$OUT" bs=4M status=progress conv=fsync
 
-# Render copperconfig.ron from the current working directory.
+# Render the current Copper config from the working directory.
+# Prefers `copperconfig.ron`, and falls back to `multi_copper.ron` for distributed demos.
 dag mission="":
 	#!/usr/bin/env bash
 	set -euo pipefail
@@ -347,8 +400,11 @@ dag mission="":
 	invocation_dir="{{invocation_directory()}}"
 	cfg_path="${invocation_dir}/copperconfig.ron"
 	if [[ ! -f "$cfg_path" ]]; then
-		echo "No copperconfig.ron found in ${invocation_dir}" >&2
-		exit 1
+		cfg_path="${invocation_dir}/multi_copper.ron"
+		if [[ ! -f "$cfg_path" ]]; then
+			echo "No copperconfig.ron or multi_copper.ron found in ${invocation_dir}" >&2
+			exit 1
+		fi
 	fi
 
 	cd "{{ROOT}}"

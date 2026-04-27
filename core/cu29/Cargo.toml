@@ -5,6 +5,7 @@ documentation = "https://docs.rs/cu29"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -18,16 +19,19 @@ cu29-derive = { workspace = true }
 cu29-log = { workspace = true }
 cu29-log-derive = { workspace = true }
 cu29-log-runtime = { workspace = true }
+cu29-reflect-derive = { workspace = true }
 cu29-runtime = { workspace = true }
 cu29-traits = { workspace = true }
-cu29-units = { path = "../cu29_units", version = "0.13.0", default-features = false, optional = true }
+cu29-units = { path = "../cu29_units", version = "0.15.0", default-features = false, optional = true }
 cu29-unifiedlog = { workspace = true }
 cu29-value = { workspace = true }
 defmt = { workspace = true, optional = true }
 rtsan-standalone = { workspace = true, optional = true }
 
+bevy_reflect_derive = { workspace = true, optional = true }
 bincode = { workspace = true }
 serde = { workspace = true }
+serde_derive = { workspace = true }
 
 # only std
 rayon = { workspace = true, optional = true }
@@ -47,18 +51,24 @@ units = ["dep:cu29-units"]
 macro_debug = ["cu29-derive/macro_debug", "cu29-log-derive/macro_debug"]
 logviz = ["cu29-derive/logviz"]
 signal-handler = ["dep:ctrlc", "cu29-derive/signal-handler"]
+sysclock-perf = ["std", "cu29-runtime/sysclock-perf"]
+high-precision-limiter = ["std", "cu29-runtime/high-precision-limiter"]
 log-level-debug = ["cu29-log-derive/log-level-debug"]
 log-level-info = ["cu29-log-derive/log-level-info"]
 log-level-warning = ["cu29-log-derive/log-level-warning"]
 log-level-error = ["cu29-log-derive/log-level-error"]
 log-level-critical = ["cu29-log-derive/log-level-critical"]
 reflect = [
+  "dep:bevy_reflect_derive",
   "cu29-clock/reflect",
   "cu29-runtime/reflect",
   "cu29-traits/reflect",
   "cu29-units?/reflect",
 ]
 remote-debug = ["cu29-runtime/remote-debug"]
+async-cl-io = ["std", "cu29-derive/async-cl-io", "cu29-runtime/async-cl-io"]
+parallel-rt = ["std", "cu29-derive/parallel-rt", "cu29-runtime/parallel-rt"]
+mmap-fsync = ["std", "cu29-runtime/mmap-fsync", "cu29-unifiedlog/mmap-fsync"]
 std = [
   "rayon",
   "cu29-clock/std",

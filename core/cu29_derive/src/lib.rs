@@ -1,11 +1,12 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use std::collections::{BTreeMap, HashMap};
+use quote::{ToTokens, format_ident, quote};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::read_to_string;
 use std::path::Path;
 use std::process::Command;
 use syn::Fields::{Named, Unnamed};
 use syn::meta::parser;
+use syn::parse::Parser;
 use syn::{
     Field, Fields, ItemImpl, ItemStruct, LitStr, Type, TypeTuple, parse_macro_input, parse_quote,
     parse_str,
@@ -79,6 +80,79 @@ fn detect_git_info(repo_root: &Path) -> (Option<String>, Option<bool>) {
     (commit, dirty)
 }
 
+#[derive(Debug, Clone)]
+struct CopperRuntimeArgs {
+    config_path: String,
+    subsystem_id: Option<String>,
+    sim_mode: bool,
+    ignore_resources: bool,
+}
+
+impl CopperRuntimeArgs {
+    fn parse_tokens(args: proc_macro2::TokenStream) -> Result<Self, syn::Error> {
+        let mut config_file: Option<LitStr> = None;
+        let mut subsystem_id: Option<LitStr> = None;
+        let mut sim_mode = false;
+        let mut ignore_resources = false;
+
+        let parser = parser(|meta| {
+            if meta.path.is_ident("config") {
+                config_file = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if meta.path.is_ident("subsystem") {
+                subsystem_id = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if meta.path.is_ident("sim_mode") {
+                if meta.input.peek(syn::Token![=]) {
+                    meta.input.parse::<syn::Token![=]>()?;
+                    let value: syn::LitBool = meta.input.parse()?;
+                    sim_mode = value.value();
+                } else {
+                    sim_mode = true;
+                }
+                Ok(())
+            } else if meta.path.is_ident("ignore_resources") {
+                if meta.input.peek(syn::Token![=]) {
+                    meta.input.parse::<syn::Token![=]>()?;
+                    let value: syn::LitBool = meta.input.parse()?;
+                    ignore_resources = value.value();
+                } else {
+                    ignore_resources = true;
+                }
+                Ok(())
+            } else {
+                Err(meta.error("unsupported property"))
+            }
+        });
+
+        parser.parse2(args)?;
+
+        let config_path = config_file
+            .ok_or_else(|| {
+                syn::Error::new(
+                    Span::call_site(),
+                    "Expected config file attribute like #[copper_runtime(config = \"path\")]",
+                )
+            })?
+            .value();
+
+        Ok(Self {
+            config_path,
+            subsystem_id: subsystem_id.map(|value| value.value()),
+            sim_mode,
+            ignore_resources,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedRuntimeConfig {
+    local_config: CuConfig,
+    bundled_local_config_content: String,
+    subsystem_id: Option<String>,
+    subsystem_code: u16,
+}
+
 #[proc_macro]
 pub fn resources(input: TokenStream) -> TokenStream {
     resources::resources(input)
@@ -139,7 +213,6 @@ pub fn gen_cumsgs(config_path_lit: TokenStream) -> TokenStream {
         use cu29::prelude::ErasedCuStampedData;
         use cu29::prelude::ErasedCuStampedDataSet;
         use cu29::prelude::MatchingTasks;
-        use cu29::prelude::Serialize;
         use cu29::prelude::CuMsg;
         use cu29::prelude::CuMsgMetadata;
         use cu29::prelude::CuListZeroedInit;
@@ -216,7 +289,7 @@ fn build_gen_cumsgs_support(
     graph: &CuGraph,
     mission_label: Option<&str>,
 ) -> CuResult<proc_macro2::TokenStream> {
-    let task_specs = CuTaskSpecSet::from_graph(graph);
+    let task_specs = CuTaskSpecSet::from_graph(graph)?;
     let channel_usage = collect_bridge_channel_usage(graph);
     let mut bridge_specs = build_bridge_specs(cuconfig, graph, &channel_usage);
     let (culist_plan, exec_entities, plan_to_original) =
@@ -251,6 +324,8 @@ fn build_gen_cumsgs_support(
     }
 
     Ok(gen_culist_support(
+        cuconfig,
+        mission_label,
         &culist_plan,
         &culist_order,
         &node_output_positions,
@@ -261,6 +336,8 @@ fn build_gen_cumsgs_support(
 
 /// Build the inner support of the copper list.
 fn gen_culist_support(
+    cuconfig: &CuConfig,
+    mission_label: Option<&str>,
     runtime_plan: &CuExecutionLoop,
     culist_indices_in_plan_order: &[usize],
     node_output_positions: &HashMap<NodeId, usize>,
@@ -277,11 +354,42 @@ fn gen_culist_support(
     #[cfg(feature = "macro_debug")]
     eprintln!("[build the copperlist struct]");
     let msgs_types_tuple: TypeTuple = build_culist_tuple(&slot_types);
+    let cumsg_count: usize = output_packs.iter().map(|pack| pack.msg_types.len()).sum();
+    let flat_codec_bindings = build_flat_slot_codec_bindings(
+        cuconfig,
+        mission_label,
+        &output_packs,
+        node_output_positions,
+        task_names,
+    )
+    .unwrap_or_else(|err| panic!("Could not resolve log codec bindings: {err}"));
+    let default_config_ron_ident = format_ident!("__CU_LOGCODEC_DEFAULT_CONFIG_RON");
+    let default_config_ron = cuconfig
+        .serialize_ron()
+        .unwrap_or_else(|_| "<failed to serialize config>".to_string());
+    let default_config_ron_lit = LitStr::new(&default_config_ron, Span::call_site());
+    let (codec_helper_fns, encode_helper_names, decode_helper_names) = build_culist_codec_helpers(
+        &flat_codec_bindings,
+        &default_config_ron_ident,
+        mission_label,
+    );
+    let default_config_ron_const = if flat_codec_bindings.iter().any(Option::is_some) {
+        quote! {
+            const #default_config_ron_ident: &str = #default_config_ron_lit;
+        }
+    } else {
+        quote! {}
+    };
 
     #[cfg(feature = "macro_debug")]
     eprintln!("[build the copperlist tuple bincode support]");
-    let msgs_types_tuple_encode = build_culist_tuple_encode(&slot_types);
-    let msgs_types_tuple_decode = build_culist_tuple_decode(&slot_types);
+    let msgs_types_tuple_encode = build_culist_tuple_encode(&output_packs, &encode_helper_names);
+    let msgs_types_tuple_decode = build_culist_tuple_decode(
+        &output_packs,
+        &slot_types,
+        cumsg_count,
+        &decode_helper_names,
+    );
 
     #[cfg(feature = "macro_debug")]
     eprintln!("[build the copperlist tuple debug support]");
@@ -293,7 +401,7 @@ fn gen_culist_support(
 
     #[cfg(feature = "macro_debug")]
     eprintln!("[build the default tuple support]");
-    let msgs_types_tuple_default = build_culist_tuple_default(&slot_types);
+    let msgs_types_tuple_default = build_culist_tuple_default(&slot_types, cumsg_count);
 
     #[cfg(feature = "macro_debug")]
     eprintln!("[build erasedcumsgs]");
@@ -329,6 +437,7 @@ fn gen_culist_support(
                         cu29::clock::OptionCuTime::none();
                     self.0.#slot_index.#port_index.metadata.process_time.end =
                         cu29::clock::OptionCuTime::none();
+                    self.0.#slot_index.#port_index.metadata.origin = None;
                 });
             }
         } else {
@@ -336,6 +445,7 @@ fn gen_culist_support(
                 self.0.#slot_index.metadata.status_txt = CuCompactString::default();
                 self.0.#slot_index.metadata.process_time.start = cu29::clock::OptionCuTime::none();
                 self.0.#slot_index.metadata.process_time.end = cu29::clock::OptionCuTime::none();
+                self.0.#slot_index.metadata.origin = None;
             });
         }
     }
@@ -345,11 +455,9 @@ fn gen_culist_support(
         }
     };
 
-    let cumsg_count: usize = output_packs.iter().map(|pack| pack.msg_types.len()).sum();
-
     let payload_bytes_accumulators: Vec<proc_macro2::TokenStream> = culist_indices_in_plan_order
         .iter()
-        .map(|idx| {
+        .scan(0usize, |flat_idx, idx| {
             let slot_index = syn::Index::from(*idx);
             let pack = output_packs
                 .get(*idx)
@@ -357,21 +465,45 @@ fn gen_culist_support(
             if pack.is_multi() {
                 let iter = (0..pack.msg_types.len()).map(|port_idx| {
                     let port_index = syn::Index::from(port_idx);
+                    let cache_index = syn::Index::from(*flat_idx);
+                    *flat_idx += 1;
                     quote! {
                         if let Some(payload) = culist.msgs.0.#slot_index.#port_index.payload() {
-                            raw += cu29::monitoring::CuPayloadSize::raw_bytes(payload);
-                            handles += cu29::monitoring::CuPayloadSize::handle_bytes(payload);
+                            let cached = culist.msgs.1.get(#cache_index);
+                            let io = if cached.present {
+                                cu29::monitoring::PayloadIoStats {
+                                    resident_bytes: cached.resident_bytes as usize,
+                                    encoded_bytes: cached.encoded_bytes as usize,
+                                    handle_bytes: cached.handle_bytes as usize,
+                                }
+                            } else {
+                                cu29::monitoring::payload_io_stats(payload)?
+                            };
+                            raw += io.resident_bytes;
+                            handles += io.handle_bytes;
                         }
                     }
                 });
-                quote! { #(#iter)* }
+                Some(quote! { #(#iter)* })
             } else {
-                quote! {
+                let cache_index = syn::Index::from(*flat_idx);
+                *flat_idx += 1;
+                Some(quote! {
                     if let Some(payload) = culist.msgs.0.#slot_index.payload() {
-                        raw += cu29::monitoring::CuPayloadSize::raw_bytes(payload);
-                        handles += cu29::monitoring::CuPayloadSize::handle_bytes(payload);
+                        let cached = culist.msgs.1.get(#cache_index);
+                        let io = if cached.present {
+                            cu29::monitoring::PayloadIoStats {
+                                resident_bytes: cached.resident_bytes as usize,
+                                encoded_bytes: cached.encoded_bytes as usize,
+                                handle_bytes: cached.handle_bytes as usize,
+                            }
+                        } else {
+                            cu29::monitoring::payload_io_stats(payload)?
+                        };
+                        raw += io.resident_bytes;
+                        handles += io.handle_bytes;
                     }
-                }
+                })
             }
         })
         .collect();
@@ -379,42 +511,56 @@ fn gen_culist_support(
     let payload_raw_bytes_accumulators: Vec<proc_macro2::TokenStream> = output_packs
         .iter()
         .enumerate()
-        .map(|(slot_idx, pack)| {
+        .scan(0usize, |flat_idx, (slot_idx, pack)| {
             let slot_index = syn::Index::from(slot_idx);
             if pack.is_multi() {
                 let iter = (0..pack.msg_types.len()).map(|port_idx| {
                     let port_index = syn::Index::from(port_idx);
+                    let cache_index = syn::Index::from(*flat_idx);
+                    *flat_idx += 1;
                     quote! {
                         if let Some(payload) = self.0.#slot_index.#port_index.payload() {
-                            bytes.push(Some(
-                                cu29::monitoring::CuPayloadSize::raw_bytes(payload) as u64
-                            ));
+                            let cached = self.1.get(#cache_index);
+                            bytes.push(if cached.present {
+                                Some(cached.resident_bytes)
+                            } else {
+                                cu29::monitoring::payload_io_stats(payload)
+                                    .ok()
+                                    .map(|io| io.resident_bytes as u64)
+                            });
                         } else {
                             bytes.push(None);
                         }
                     }
                 });
-                quote! { #(#iter)* }
+                Some(quote! { #(#iter)* })
             } else {
-                quote! {
+                let cache_index = syn::Index::from(*flat_idx);
+                *flat_idx += 1;
+                Some(quote! {
                     if let Some(payload) = self.0.#slot_index.payload() {
-                        bytes.push(Some(
-                            cu29::monitoring::CuPayloadSize::raw_bytes(payload) as u64
-                        ));
+                        let cached = self.1.get(#cache_index);
+                        bytes.push(if cached.present {
+                            Some(cached.resident_bytes)
+                        } else {
+                            cu29::monitoring::payload_io_stats(payload)
+                                .ok()
+                                .map(|io| io.resident_bytes as u64)
+                        });
                     } else {
                         bytes.push(None);
                     }
-                }
+                })
             }
         })
         .collect();
 
     let compute_payload_bytes_fn = quote! {
-        pub fn compute_payload_bytes(culist: &CuList) -> (u64, u64) {
+        pub fn compute_payload_bytes(culist: &CuList) -> cu29::prelude::CuResult<(u64, u64)> {
             let mut raw: usize = 0;
             let mut handles: usize = 0;
             #(#payload_bytes_accumulators)*
-            (raw as u64, handles as u64)
+            Ok((raw as u64, handles as u64))
         }
     };
 
@@ -521,7 +667,22 @@ fn gen_culist_support(
         }
     }
 
-    let task_name_literals = flatten_slot_origin_ids(&output_packs, slot_origin_ids);
+    let task_name_literals = flatten_slot_origin_ids(&output_packs, &slot_origin_ids);
+    let task_output_specs = flatten_task_output_specs(&output_packs, &slot_origin_ids);
+    let task_output_spec_literals: Vec<proc_macro2::TokenStream> = task_output_specs
+        .iter()
+        .map(|(task_id, msg_type, payload_type)| {
+            let task_id = LitStr::new(task_id, Span::call_site());
+            let msg_type = LitStr::new(msg_type, Span::call_site());
+            quote! {
+                cu29::TaskOutputSpec {
+                    task_id: #task_id,
+                    msg_type: #msg_type,
+                    payload_type_path_fn: <#payload_type as cu29::prelude::TypePath>::type_path,
+                }
+            }
+        })
+        .collect();
 
     let mut logviz_blocks = Vec::new();
     for (slot_idx, pack) in output_packs.iter().enumerate() {
@@ -610,8 +771,10 @@ fn gen_culist_support(
     quote! {
         #collect_metadata_function
         #compute_payload_bytes_fn
+        #default_config_ron_const
+        #(#codec_helper_fns)*
 
-        pub struct CuStampedDataSet(pub #msgs_types_tuple);
+        pub struct CuStampedDataSet(pub #msgs_types_tuple, cu29::monitoring::CuMsgIoCache<#cumsg_count>);
 
         pub type CuList = CopperList<CuStampedDataSet>;
 
@@ -637,6 +800,11 @@ fn gen_culist_support(
             fn get_all_task_ids() -> &'static [&'static str] {
                 &[#(#task_name_literals),*]
             }
+
+            #[allow(dead_code)]
+            fn get_output_specs() -> &'static [cu29::TaskOutputSpec] {
+                &[#(#task_output_spec_literals),*]
+            }
         }
 
         // Note: PayloadSchemas is NOT implemented here.
@@ -661,6 +829,7 @@ fn gen_culist_support(
 
         impl CuListZeroedInit for CuStampedDataSet {
             fn init_zeroed(&mut self) {
+                self.1.clear();
                 #(#zeroed_init_tokens)*
             }
         }
@@ -738,12 +907,27 @@ fn gen_sim_support(
                     let enum_entry_name = config_id_to_enum(&format!("{}_tx_{}", bridge_spec.id, channel.id));
                     let enum_ident = Ident::new(&enum_entry_name, Span::call_site());
                     let channel_type: Type = parse_str::<Type>(channel.msg_type_name.as_str()).unwrap();
+                    let output_pack = step
+                        .output_msg_pack
+                        .as_ref()
+                        .expect("Bridge Tx channel missing output pack for sim support");
+                    let output_types: Vec<Type> = output_pack
+                        .msg_types
+                        .iter()
+                        .map(|msg_type| {
+                            parse_str::<Type>(msg_type.as_str()).unwrap_or_else(|_| {
+                                panic!("Could not transform {msg_type} into a message Rust type.")
+                            })
+                        })
+                        .collect();
+                    let output_type = build_output_slot_type(&output_types);
                     let bridge_type = runtime_bridge_type_for_spec(bridge_spec, true);
                     let _const_ident = &channel.const_ident;
                     quote! {
                         #enum_ident {
                             channel: &'static cu29::cubridge::BridgeChannel<< <#bridge_type as cu29::cubridge::CuBridge>::Tx as cu29::cubridge::BridgeChannelSet >::Id, #channel_type>,
                             msg: &'a CuMsg<#channel_type>,
+                            output: &'a mut #output_type,
                         }
                     }
                 }
@@ -776,10 +960,114 @@ fn gen_sim_support(
     }
 }
 
-/// Adds `#[copper_runtime(config = "path", sim_mode = false/true, ignore_resources = false/true)]`
+fn gen_recorded_replay_support(
+    runtime_plan: &CuExecutionLoop,
+    exec_entities: &[ExecutionEntity],
+    bridge_specs: &[BridgeSpec],
+) -> proc_macro2::TokenStream {
+    let replay_arms: Vec<proc_macro2::TokenStream> = runtime_plan
+        .steps
+        .iter()
+        .filter_map(|unit| match unit {
+            CuExecutionUnit::Step(step) => match &exec_entities[step.node_id as usize].kind {
+                ExecutionEntityKind::Task { .. } => {
+                    let enum_entry_name = config_id_to_enum(step.node.get_id().as_str());
+                    let enum_ident = Ident::new(&enum_entry_name, Span::call_site());
+                    let output_pack = step
+                        .output_msg_pack
+                        .as_ref()
+                        .expect("Task step missing output pack for recorded replay");
+                    let culist_index = int2sliceindex(output_pack.culist_index);
+                    Some(quote! {
+                        SimStep::#enum_ident(CuTaskCallbackState::Process(_, output)) => {
+                            *output = recorded.msgs.0.#culist_index.clone();
+                            SimOverride::ExecutedBySim
+                        }
+                    })
+                }
+                ExecutionEntityKind::BridgeRx {
+                    bridge_index,
+                    channel_index,
+                } => {
+                    let bridge_spec = &bridge_specs[*bridge_index];
+                    let channel = &bridge_spec.rx_channels[*channel_index];
+                    let enum_entry_name =
+                        config_id_to_enum(&format!("{}_rx_{}", bridge_spec.id, channel.id));
+                    let enum_ident = Ident::new(&enum_entry_name, Span::call_site());
+                    let output_pack = step
+                        .output_msg_pack
+                        .as_ref()
+                        .expect("Bridge Rx channel missing output pack for recorded replay");
+                    let port_index = output_pack
+                        .msg_types
+                        .iter()
+                        .position(|msg| msg == &channel.msg_type_name)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Bridge Rx channel '{}' missing output port for '{}'",
+                                channel.id, channel.msg_type_name
+                            )
+                        });
+                    let culist_index = int2sliceindex(output_pack.culist_index);
+                    let recorded_slot = if output_pack.msg_types.len() == 1 {
+                        quote! { recorded.msgs.0.#culist_index.clone() }
+                    } else {
+                        let port_index = syn::Index::from(port_index);
+                        quote! { recorded.msgs.0.#culist_index.#port_index.clone() }
+                    };
+                    Some(quote! {
+                        SimStep::#enum_ident { msg, .. } => {
+                            *msg = #recorded_slot;
+                            SimOverride::ExecutedBySim
+                        }
+                    })
+                }
+                ExecutionEntityKind::BridgeTx {
+                    bridge_index,
+                    channel_index,
+                } => {
+                    let bridge_spec = &bridge_specs[*bridge_index];
+                    let channel = &bridge_spec.tx_channels[*channel_index];
+                    let enum_entry_name =
+                        config_id_to_enum(&format!("{}_tx_{}", bridge_spec.id, channel.id));
+                    let enum_ident = Ident::new(&enum_entry_name, Span::call_site());
+                    let output_pack = step
+                        .output_msg_pack
+                        .as_ref()
+                        .expect("Bridge Tx channel missing output pack for recorded replay");
+                    let culist_index = int2sliceindex(output_pack.culist_index);
+                    Some(quote! {
+                        SimStep::#enum_ident { output, .. } => {
+                            *output = recorded.msgs.0.#culist_index.clone();
+                            SimOverride::ExecutedBySim
+                        }
+                    })
+                }
+            },
+            CuExecutionUnit::Loop(_) => None,
+        })
+        .collect();
+
+    quote! {
+        #[allow(dead_code)]
+        pub fn recorded_replay_step<'a>(
+            step: SimStep<'a>,
+            recorded: &CopperList<CuStampedDataSet>,
+        ) -> SimOverride {
+            match step {
+                #(#replay_arms),*,
+                _ => SimOverride::ExecuteByRuntime,
+            }
+        }
+    }
+}
+
+/// Adds `#[copper_runtime(config = "path", subsystem = "id", sim_mode = false/true, ignore_resources = false/true)]`
 /// to your application struct to generate the runtime.
 /// if sim_mode is omitted, it is set to false.
 /// if ignore_resources is omitted, it is set to false.
+/// if `subsystem` is provided, `config` must point to a strict multi-Copper config and the
+/// selected subsystem local config will be embedded into the generated runtime.
 /// This will add a "runtime" field to your struct and implement the "new" and "run" methods.
 #[proc_macro_attribute]
 pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -789,10 +1077,13 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let application_name = &application_struct.ident;
     let builder_name = format_ident!("{}Builder", application_name);
-
-    let mut config_file: Option<LitStr> = None;
-    let mut sim_mode = false;
-    let mut ignore_resources = false;
+    let runtime_args = match CopperRuntimeArgs::parse_tokens(args.into()) {
+        Ok(runtime_args) => runtime_args,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let config_file = runtime_args.config_path.clone();
+    let sim_mode = runtime_args.sim_mode;
+    let ignore_resources = runtime_args.ignore_resources;
 
     #[cfg(feature = "std")]
     let std = true;
@@ -800,45 +1091,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
     #[cfg(not(feature = "std"))]
     let std = false;
     let signal_handler = cfg!(feature = "signal-handler");
-
+    let parallel_rt_enabled = cfg!(feature = "parallel-rt");
     let rt_guard = rtsan_guard_tokens();
-
-    // Custom parser for the attribute arguments
-    let attribute_config_parser = parser(|meta| {
-        if meta.path.is_ident("config") {
-            config_file = Some(meta.value()?.parse()?);
-            Ok(())
-        } else if meta.path.is_ident("sim_mode") {
-            // Check if `sim_mode` has an explicit value (true/false)
-            if meta.input.peek(syn::Token![=]) {
-                meta.input.parse::<syn::Token![=]>()?;
-                let value: syn::LitBool = meta.input.parse()?;
-                sim_mode = value.value();
-                Ok(())
-            } else {
-                // If no value is provided, default to true
-                sim_mode = true;
-                Ok(())
-            }
-        } else if meta.path.is_ident("ignore_resources") {
-            if meta.input.peek(syn::Token![=]) {
-                meta.input.parse::<syn::Token![=]>()?;
-                let value: syn::LitBool = meta.input.parse()?;
-                ignore_resources = value.value();
-                Ok(())
-            } else {
-                ignore_resources = true;
-                Ok(())
-            }
-        } else {
-            Err(meta.error("unsupported property"))
-        }
-    });
-
-    #[cfg(feature = "macro_debug")]
-    eprintln!("[parse]");
-    // Parse the provided args with the custom parser
-    parse_macro_input!(args with attribute_config_parser);
 
     if ignore_resources && !sim_mode {
         return return_error(
@@ -855,35 +1109,20 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
     //         .push(syn::parse_quote!(L: UnifiedLogWrite + 'static));
     // }
 
-    // Check if the config file was provided
-    let config_file = match config_file {
-        Some(file) => file.value(),
-        None => {
-            return return_error(
-                "Expected config file attribute like #[CopperRuntime(config = \"path\")]"
-                    .to_string(),
-            );
-        }
-    };
-
-    if !std::path::Path::new(&config_full_path(&config_file)).exists() {
-        return return_error(format!(
-            "The configuration file `{config_file}` does not exist. Please provide a valid path."
-        ));
-    }
-
-    let copper_config = match read_config(&config_file) {
-        Ok(cuconfig) => cuconfig,
+    let resolved_runtime_config = match resolve_runtime_config(&runtime_args) {
+        Ok(resolved_runtime_config) => resolved_runtime_config,
         Err(e) => return return_error(e.to_string()),
     };
-    let copper_config_content = match read_to_string(config_full_path(config_file.as_str())) {
-        Ok(ok) => ok,
-        Err(e) => {
-            return return_error(format!(
-                "Could not read the config file (should not happen because we just succeeded just before). {e}"
-            ));
-        }
-    };
+    let subsystem_code = resolved_runtime_config.subsystem_code;
+    let subsystem_id = resolved_runtime_config.subsystem_id.clone();
+    let copper_config_content = resolved_runtime_config.bundled_local_config_content.clone();
+    let copper_config = resolved_runtime_config.local_config;
+    let copperlist_count = copper_config
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.copperlist_count)
+        .unwrap_or(DEFAULT_CLNB);
+    let copperlist_count_tokens = proc_macro2::Literal::usize_unsuffixed(copperlist_count);
     let caller_root = utils::caller_crate_root();
     let (git_commit, git_dirty) = detect_git_info(&caller_root);
     let git_commit_tokens = if let Some(commit) = git_commit {
@@ -896,6 +1135,12 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
     } else {
         quote! { None }
     };
+    let subsystem_code_literal = proc_macro2::Literal::u16_unsuffixed(subsystem_code);
+    let subsystem_id_tokens = if let Some(subsystem_id) = subsystem_id.as_deref() {
+        quote! { Some(#subsystem_id) }
+    } else {
+        quote! { None }
+    };
 
     #[cfg(feature = "macro_debug")]
     eprintln!("[build monitor type]");
@@ -904,7 +1149,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         (
             quote! { NoMonitor },
             quote! {
-                let monitor = NoMonitor::new(metadata, runtime)
+                let monitor_metadata = metadata.with_subsystem_id(#subsystem_id_tokens);
+                let monitor = NoMonitor::new(monitor_metadata, runtime)
                     .expect("Failed to create NoMonitor.");
                 monitor
             },
@@ -920,7 +1166,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                         .get_monitor_configs()
                         .first()
                         .and_then(|entry| entry.get_config().cloned())
-                );
+                )
+                .with_subsystem_id(#subsystem_id_tokens);
                 let monitor = #only_monitor_type::new(monitor_metadata, runtime)
                     .expect("Failed to create the given monitor.");
                 monitor
@@ -952,7 +1199,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                         .and_then(|entry| entry.get_config().cloned());
                     let __cu_monitor_metadata = metadata
                         .clone()
-                        .with_monitor_config(__cu_monitor_cfg_entry);
+                        .with_monitor_config(__cu_monitor_cfg_entry)
+                        .with_subsystem_id(#subsystem_id_tokens);
                     let #monitor_binding = #monitor_ty::new(__cu_monitor_metadata, runtime.clone())
                     .expect("Failed to create one of the configured monitors.");
                 }
@@ -975,15 +1223,18 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
     // add that to a new field
     let runtime_field: Field = if sim_mode {
         parse_quote! {
-            copper_runtime: cu29::curuntime::CuRuntime<CuSimTasks, CuBridges, CuStampedDataSet, #monitor_type, #DEFAULT_CLNB>
+            copper_runtime: cu29::curuntime::CuRuntime<CuSimTasks, CuBridges, CuStampedDataSet, #monitor_type, #copperlist_count_tokens>
         }
     } else {
         parse_quote! {
-            copper_runtime: cu29::curuntime::CuRuntime<CuTasks, CuBridges, CuStampedDataSet, #monitor_type, #DEFAULT_CLNB>
+            copper_runtime: cu29::curuntime::CuRuntime<CuTasks, CuBridges, CuStampedDataSet, #monitor_type, #copperlist_count_tokens>
         }
     };
     let lifecycle_stream_field: Field = parse_quote! {
         runtime_lifecycle_stream: Option<Box<dyn WriteStream<RuntimeLifecycleRecord>>>
+    };
+    let logger_runtime_field: Field = parse_quote! {
+        logger_runtime: cu29::prelude::LoggerRuntime
     };
 
     #[cfg(feature = "macro_debug")]
@@ -992,10 +1243,12 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         Named(fields_named) => {
             fields_named.named.push(runtime_field);
             fields_named.named.push(lifecycle_stream_field);
+            fields_named.named.push(logger_runtime_field);
         }
         Unnamed(fields_unnamed) => {
             fields_unnamed.unnamed.push(runtime_field);
             fields_unnamed.unnamed.push(lifecycle_stream_field);
+            fields_unnamed.unnamed.push(logger_runtime_field);
         }
         Fields::Unit => {
             panic!(
@@ -1004,7 +1257,11 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    let all_missions = copper_config.graphs.get_all_missions_graphs();
+    let all_missions = sorted_mission_graphs(&copper_config);
+    let task_input_layouts = match collect_task_input_layouts(&all_missions) {
+        Ok(layouts) => layouts,
+        Err(e) => return return_error(e.to_string()),
+    };
     let mut all_missions_tokens = Vec::<proc_macro2::TokenStream>::new();
     for (mission, graph) in &all_missions {
         let git_commit_tokens = git_commit_tokens.clone();
@@ -1014,7 +1271,10 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
 
         #[cfg(feature = "macro_debug")]
         eprintln!("[extract tasks ids & types]");
-        let task_specs = CuTaskSpecSet::from_graph(graph);
+        let task_specs = match CuTaskSpecSet::from_graph(graph) {
+            Ok(specs) => specs,
+            Err(e) => return return_error(e.to_string()),
+        };
 
         let culist_channel_usage = collect_bridge_channel_usage(graph);
         let mut culist_bridge_specs =
@@ -1039,6 +1299,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         }
 
         let culist_support: proc_macro2::TokenStream = gen_culist_support(
+            &copper_config,
+            Some(mission.as_str()),
             &culist_plan,
             &culist_call_order,
             &node_output_positions,
@@ -1135,7 +1397,57 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         };
 
         let task_ids = task_specs.ids.clone();
+        let autogenerated_output_warnings: Vec<proc_macro2::TokenStream> = task_specs
+            .ids
+            .iter()
+            .zip(task_specs.cutypes.iter())
+            .zip(task_specs.autogenerated_output_flags.iter())
+            .filter_map(|((task_id, task_kind), autogenerated)| {
+                if !*autogenerated {
+                    return None;
+                }
+                let warn_ident = format_ident!(
+                    "__CU_AUTOGEN_FLOATING_OUTPUT_WARNING__{}",
+                    config_id_to_enum(task_id)
+                );
+                let kind_str = match task_kind {
+                    CuTaskType::Source => "source",
+                    CuTaskType::Regular => "task",
+                    CuTaskType::Sink => return None,
+                };
+                let note = format!(
+                    "Task '{task_id}' is declared as kind '{kind_str}' but has no declared outputs. Copper synthesized a hidden floating output slot from the task trait. Add a real consumer or `dst: \"__nc__\"` if you want this to stay explicit."
+                );
+                Some(quote! {
+                    #[allow(dead_code)]
+                    #[deprecated(note = #note)]
+                    const #warn_ident: () = ();
+                    const _: () = {
+                        let _ = #warn_ident;
+                    };
+                })
+            })
+            .collect();
         let ids = build_monitored_ids(&task_ids, &mut culist_bridge_specs);
+        let parallel_rt_stage_entries = match build_parallel_rt_stage_entries(
+            &culist_plan,
+            &culist_exec_entities,
+            &task_specs,
+            &culist_bridge_specs,
+        ) {
+            Ok(entries) => entries,
+            Err(e) => return return_error(e.to_string()),
+        };
+        let parallel_rt_metadata_defs = if std && parallel_rt_enabled {
+            Some(quote! {
+                pub const PARALLEL_RT_STAGES: &'static [cu29::parallel_rt::ParallelRtStageMetadata] =
+                    &[#( #parallel_rt_stage_entries ),*];
+                pub const PARALLEL_RT_METADATA: cu29::parallel_rt::ParallelRtMetadata =
+                    cu29::parallel_rt::ParallelRtMetadata::new(PARALLEL_RT_STAGES);
+            })
+        } else {
+            None
+        };
         let monitored_component_entries: Vec<proc_macro2::TokenStream> = ids
             .iter()
             .enumerate()
@@ -1427,9 +1739,12 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 match task_type {
                     CuTaskType::Source => {
                         if *background {
-                            panic!("CuSrcTask {task_id} cannot be a background task, it should be a regular task.");
-                        }
-                        if *run_in_sim {
+                            if let Some(out_ty) = output_type {
+                                parse_quote!(CuAsyncSrcTask<#sim_type, #out_ty>)
+                            } else {
+                                panic!("{task_id}: If a source is background, it has to have an output");
+                            }
+                        } else if *run_in_sim {
                             sim_type.clone()
                         } else {
                             let msg_type = graph
@@ -1510,16 +1825,42 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 let background = task_specs.background_flags[index];
                 let inner_task_type = &task_specs.sim_task_types[index];
                 match task_specs.cutypes[index] {
-                    CuTaskType::Source => quote! {
-                        {
-                            let resources = <<#ty as CuSrcTask>::Resources<'_> as ResourceBindings>::from_bindings(
-                                resources,
-                                #mapping_ref,
-                            ).map_err(|e| e.add_cause(#additional_error_info))?;
-                            <#ty as CuSrcTask>::new(all_instances_configs[#index], resources)
-                                .map_err(|e| e.add_cause(#additional_error_info))?
+                    CuTaskType::Source => {
+                        if background {
+                            let threadpool_bundle_index = threadpool_bundle_index
+                                .expect("threadpool bundle missing for background tasks");
+                            quote! {
+                                {
+                                    let inner_resources = <<#inner_task_type as CuSrcTask>::Resources<'_> as ResourceBindings>::from_bindings(
+                                        resources,
+                                        #mapping_ref,
+                                    ).map_err(|e| e.add_cause(#additional_error_info))?;
+                                    let threadpool_key = cu29::resource::ResourceKey::new(
+                                        cu29::resource::BundleIndex::new(#threadpool_bundle_index),
+                                        <cu29::resource::ThreadPoolBundle as cu29::resource::ResourceBundleDecl>::Id::BgThreads as usize,
+                                    );
+                                    let threadpool = resources.borrow_shared_arc(threadpool_key)?;
+                                    let resources = cu29::cuasynctask::CuAsyncSrcTaskResources {
+                                        inner: inner_resources,
+                                        threadpool,
+                                    };
+                                    <#ty as CuSrcTask>::new(all_instances_configs[#index], resources)
+                                        .map_err(|e| e.add_cause(#additional_error_info))?
+                                }
+                            }
+                        } else {
+                            quote! {
+                                {
+                                    let resources = <<#ty as CuSrcTask>::Resources<'_> as ResourceBindings>::from_bindings(
+                                        resources,
+                                        #mapping_ref,
+                                    ).map_err(|e| e.add_cause(#additional_error_info))?;
+                                    <#ty as CuSrcTask>::new(all_instances_configs[#index], resources)
+                                        .map_err(|e| e.add_cause(#additional_error_info))?
+                                }
+                            }
                         }
-                    },
+                    }
                     CuTaskType::Regular => {
                         if background {
                             let threadpool_bundle_index = threadpool_bundle_index
@@ -1583,16 +1924,42 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 let mapping_ref = task_resource_mappings.refs[index].clone();
                 let inner_task_type = &task_specs.sim_task_types[index];
                 match task_specs.cutypes[index] {
-                    CuTaskType::Source => quote! {
-                        {
-                            let resources = <<#task_type as CuSrcTask>::Resources<'_> as ResourceBindings>::from_bindings(
-                                resources,
-                                #mapping_ref,
-                            ).map_err(|e| e.add_cause(#additional_error_info))?;
-                            <#task_type as CuSrcTask>::new(all_instances_configs[#index], resources)
-                                .map_err(|e| e.add_cause(#additional_error_info))?
+                    CuTaskType::Source => {
+                        if *background {
+                            let threadpool_bundle_index = threadpool_bundle_index
+                                .expect("threadpool bundle missing for background tasks");
+                            quote! {
+                                {
+                                    let inner_resources = <<#inner_task_type as CuSrcTask>::Resources<'_> as ResourceBindings>::from_bindings(
+                                        resources,
+                                        #mapping_ref,
+                                    ).map_err(|e| e.add_cause(#additional_error_info))?;
+                                    let threadpool_key = cu29::resource::ResourceKey::new(
+                                        cu29::resource::BundleIndex::new(#threadpool_bundle_index),
+                                        <cu29::resource::ThreadPoolBundle as cu29::resource::ResourceBundleDecl>::Id::BgThreads as usize,
+                                    );
+                                    let threadpool = resources.borrow_shared_arc(threadpool_key)?;
+                                    let resources = cu29::cuasynctask::CuAsyncSrcTaskResources {
+                                        inner: inner_resources,
+                                        threadpool,
+                                    };
+                                    <#task_type as CuSrcTask>::new(all_instances_configs[#index], resources)
+                                        .map_err(|e| e.add_cause(#additional_error_info))?
+                                }
+                            }
+                        } else {
+                            quote! {
+                                {
+                                    let resources = <<#task_type as CuSrcTask>::Resources<'_> as ResourceBindings>::from_bindings(
+                                        resources,
+                                        #mapping_ref,
+                                    ).map_err(|e| e.add_cause(#additional_error_info))?;
+                                    <#task_type as CuSrcTask>::new(all_instances_configs[#index], resources)
+                                        .map_err(|e| e.add_cause(#additional_error_info))?
+                                }
+                            }
                         }
-                    },
+                    }
                     CuTaskType::Regular => {
                         if *background {
                             let threadpool_bundle_index = threadpool_bundle_index
@@ -1643,26 +2010,51 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             })
             .collect::<Vec<_>>();
 
+        let mut keyframe_task_restore_order = Vec::new();
+        for unit in &culist_plan.steps {
+            let CuExecutionUnit::Step(step) = unit else {
+                panic!("Execution loops are not supported in runtime generation");
+            };
+            let ExecutionEntityKind::Task { task_index } =
+                &culist_exec_entities[step.node_id as usize].kind
+            else {
+                continue;
+            };
+            if !keyframe_task_restore_order.contains(task_index) {
+                keyframe_task_restore_order.push(*task_index);
+            }
+        }
+        if keyframe_task_restore_order.len() != task_specs.task_types.len() {
+            return return_error(format!(
+                "Keyframe restore order covers {} task steps but mission declares {} tasks",
+                keyframe_task_restore_order.len(),
+                task_specs.task_types.len()
+            ));
+        }
+        let task_restore_code: Vec<proc_macro2::TokenStream> = keyframe_task_restore_order
+            .iter()
+            .map(|index| {
+                let task_tuple_index = syn::Index::from(*index);
+                quote! {
+                    tasks.#task_tuple_index.thaw(&mut decoder).map_err(|e| CuError::from("Failed to thaw").add_cause(&e.to_string()))?
+                }
+            })
+            .collect();
+
         // Generate the code to create instances of the nodes
         // It maps the types to their index
         let (
-            task_restore_code,
             task_start_calls,
             task_stop_calls,
             task_preprocess_calls,
             task_postprocess_calls,
-        ): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) = itertools::multiunzip(
+        ): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = itertools::multiunzip(
             (0..task_specs.task_types.len())
             .map(|index| {
                 let task_index = int2sliceindex(index as u32);
-                let task_tuple_index = syn::Index::from(index);
                 let task_enum_name = config_id_to_enum(&task_specs.ids[index]);
                 let enum_name = Ident::new(&task_enum_name, Span::call_site());
                 (
-                    // Tasks keyframe restore code
-                    quote! {
-                        tasks.#task_tuple_index.thaw(&mut decoder).map_err(|e| CuError::from("Failed to thaw").add_cause(&e.to_string()))?
-                    },
                     {  // Start calls
                         let monitoring_action = quote! {
                             let decision = self.copper_runtime.monitor.process_error(cu29::monitoring::ComponentId::new(#index), CuComponentState::Start, &error);
@@ -2185,6 +2577,7 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         preprocess_calls.extend(task_preprocess_calls);
         let mut postprocess_calls = task_postprocess_calls;
         postprocess_calls.extend(bridge_postprocess_calls);
+        let parallel_rt_run_supported = std && parallel_rt_enabled && !sim_mode;
 
         // Bridges are frozen alongside tasks; restore them in the same order.
         let bridge_restore_code: Vec<proc_macro2::TokenStream> = culist_bridge_specs
@@ -2225,9 +2618,19 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                             step,
                             *task_index,
                             &task_specs,
-                            &output_pack_sizes,
-                            sim_mode,
-                            &mission_mod,
+                            StepGenerationContext::new(
+                                &output_pack_sizes,
+                                &task_input_layouts,
+                                mission.as_str(),
+                                sim_mode,
+                                &mission_mod,
+                                ParallelLifecyclePlacement::default(),
+                                false,
+                            ),
+                            TaskExecutionTokens::new(quote! {}, {
+                                let node_index = int2sliceindex(*task_index as u32);
+                                quote! { tasks.#node_index }
+                            }),
                         ),
                         ExecutionEntityKind::BridgeRx {
                             bridge_index,
@@ -2238,8 +2641,20 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                                 step,
                                 spec,
                                 *channel_index,
-                                &mission_mod,
-                                sim_mode,
+                                StepGenerationContext::new(
+                                    &output_pack_sizes,
+                                    &task_input_layouts,
+                                    mission.as_str(),
+                                    sim_mode,
+                                    &mission_mod,
+                                    ParallelLifecyclePlacement::default(),
+                                    false,
+                                ),
+                                {
+                                    let bridge_tuple_index =
+                                        int2sliceindex(spec.tuple_index as u32);
+                                    quote! { let bridge = &mut __cu_bridges.#bridge_tuple_index; }
+                                },
                             )
                         }
                         ExecutionEntityKind::BridgeTx {
@@ -2251,9 +2666,20 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                                 step,
                                 spec,
                                 *channel_index,
-                                &output_pack_sizes,
-                                &mission_mod,
-                                sim_mode,
+                                StepGenerationContext::new(
+                                    &output_pack_sizes,
+                                    &task_input_layouts,
+                                    mission.as_str(),
+                                    sim_mode,
+                                    &mission_mod,
+                                    ParallelLifecyclePlacement::default(),
+                                    false,
+                                ),
+                                {
+                                    let bridge_tuple_index =
+                                        int2sliceindex(spec.tuple_index as u32);
+                                    quote! { let bridge = &mut __cu_bridges.#bridge_tuple_index; }
+                                },
                             )
                         }
                     }
@@ -2263,6 +2689,115 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 }
             })
             .collect();
+        let parallel_lifecycle_placements = if parallel_rt_run_supported {
+            Some(build_parallel_lifecycle_placements(
+                &culist_plan,
+                &culist_exec_entities,
+            ))
+        } else {
+            None
+        };
+        let runtime_plan_parallel_code_and_logging: Option<
+            Vec<(proc_macro2::TokenStream, proc_macro2::TokenStream)>,
+        > = if parallel_rt_run_supported {
+            Some(
+                culist_plan
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .map(|(step_index, unit)| match unit {
+                        CuExecutionUnit::Step(step) => match &culist_exec_entities
+                            [step.node_id as usize]
+                            .kind
+                        {
+                            ExecutionEntityKind::Task { task_index } => {
+                                let task_index_ts = int2sliceindex(*task_index as u32);
+                                generate_task_execution_tokens(
+                                    step,
+                                    *task_index,
+                                    &task_specs,
+                                    StepGenerationContext::new(
+                                        &output_pack_sizes,
+                                        &task_input_layouts,
+                                        mission.as_str(),
+                                        false,
+                                        &mission_mod,
+                                        parallel_lifecycle_placements
+                                            .as_ref()
+                                            .expect("parallel lifecycle placements missing")[step_index],
+                                        true,
+                                    ),
+                                    TaskExecutionTokens::new(quote! {
+                                        let _task_lock = step_rt.task_locks.#task_index_ts.lock().expect("parallel task lock poisoned");
+                                        let task = unsafe { step_rt.task_ptrs.#task_index_ts.as_mut() };
+                                    }, quote! { (*task) }),
+                                )
+                            }
+                            ExecutionEntityKind::BridgeRx {
+                                bridge_index,
+                                channel_index,
+                            } => {
+                                let spec = &culist_bridge_specs[*bridge_index];
+                                let bridge_index_ts = int2sliceindex(spec.tuple_index as u32);
+                                generate_bridge_rx_execution_tokens(
+                                    step,
+                                    spec,
+                                    *channel_index,
+                                    StepGenerationContext::new(
+                                        &output_pack_sizes,
+                                        &task_input_layouts,
+                                        mission.as_str(),
+                                        false,
+                                        &mission_mod,
+                                        parallel_lifecycle_placements
+                                            .as_ref()
+                                            .expect("parallel lifecycle placements missing")
+                                            [step_index],
+                                        true,
+                                    ),
+                                    quote! {
+                                        let _bridge_lock = step_rt.bridge_locks.#bridge_index_ts.lock().expect("parallel bridge lock poisoned");
+                                        let bridge = unsafe { step_rt.bridge_ptrs.#bridge_index_ts.as_mut() };
+                                    },
+                                )
+                            }
+                            ExecutionEntityKind::BridgeTx {
+                                bridge_index,
+                                channel_index,
+                            } => {
+                                let spec = &culist_bridge_specs[*bridge_index];
+                                let bridge_index_ts = int2sliceindex(spec.tuple_index as u32);
+                                generate_bridge_tx_execution_tokens(
+                                    step,
+                                    spec,
+                                    *channel_index,
+                                    StepGenerationContext::new(
+                                        &output_pack_sizes,
+                                        &task_input_layouts,
+                                        mission.as_str(),
+                                        false,
+                                        &mission_mod,
+                                        parallel_lifecycle_placements
+                                            .as_ref()
+                                            .expect("parallel lifecycle placements missing")[step_index],
+                                        true,
+                                    ),
+                                    quote! {
+                                        let _bridge_lock = step_rt.bridge_locks.#bridge_index_ts.lock().expect("parallel bridge lock poisoned");
+                                        let bridge = unsafe { step_rt.bridge_ptrs.#bridge_index_ts.as_mut() };
+                                    },
+                                )
+                            }
+                        },
+                        CuExecutionUnit::Loop(_) => {
+                            panic!("Execution loops are not supported in runtime generation");
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         let sim_support = if sim_mode {
             Some(gen_sim_support(
@@ -2274,11 +2809,18 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             None
         };
 
-        let (new, run_one_iteration, start_all_tasks, stop_all_tasks, run) = if sim_mode {
+        let recorded_replay_support = if sim_mode {
+            Some(gen_recorded_replay_support(
+                &culist_plan,
+                &culist_exec_entities,
+                &culist_bridge_specs,
+            ))
+        } else {
+            None
+        };
+
+        let (run_one_iteration, start_all_tasks, stop_all_tasks, run) = if sim_mode {
             (
-                quote! {
-                    fn new(clock:RobotClock, unified_logger: Arc<Mutex<L>>, config_override: Option<CuConfig>, sim_callback: &mut impl FnMut(SimStep) -> SimOverride) -> CuResult<Self>
-                },
                 quote! {
                     fn run_one_iteration(&mut self, sim_callback: &mut impl FnMut(SimStep) -> SimOverride) -> CuResult<()>
                 },
@@ -2294,16 +2836,6 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             )
         } else {
             (
-                if std {
-                    quote! {
-                        fn new(clock:RobotClock, unified_logger: Arc<Mutex<L>>, config_override: Option<CuConfig>) -> CuResult<Self>
-                    }
-                } else {
-                    quote! {
-                        // no config override is possible in no-std
-                        fn new(clock:RobotClock, unified_logger: Arc<Mutex<L>>) -> CuResult<Self>
-                    }
-                },
                 quote! {
                     fn run_one_iteration(&mut self) -> CuResult<()>
                 },
@@ -2370,76 +2902,521 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
 
         let (runtime_plan_code, preprocess_logging_calls): (Vec<_>, Vec<_>) =
             itertools::multiunzip(runtime_plan_code_and_logging);
+        let process_step_tasks_type = if sim_mode {
+            quote!(CuSimTasks)
+        } else {
+            quote!(CuTasks)
+        };
+        let (
+            parallel_process_step_idents,
+            parallel_process_step_fn_defs,
+            parallel_stage_worker_spawns,
+        ): (
+            Vec<Ident>,
+            Vec<proc_macro2::TokenStream>,
+            Vec<proc_macro2::TokenStream>,
+        ) = if let Some(runtime_plan_parallel_code_and_logging) =
+            &runtime_plan_parallel_code_and_logging
+        {
+            let (runtime_plan_parallel_step_code, _): (Vec<_>, Vec<_>) =
+                itertools::multiunzip(runtime_plan_parallel_code_and_logging.clone());
+            let parallel_process_step_idents: Vec<Ident> = (0..runtime_plan_parallel_step_code
+                .len())
+                .map(|index| format_ident!("__cu_parallel_process_step_{index}"))
+                .collect();
+            let parallel_process_step_fn_defs: Vec<proc_macro2::TokenStream> =
+                parallel_process_step_idents
+                    .iter()
+                    .zip(runtime_plan_parallel_step_code.iter())
+                    .map(|(step_ident, step_code)| {
+                        quote! {
+                            #[inline(always)]
+                            fn #step_ident(
+                                step_rt: &mut ParallelProcessStepRuntime<'_>,
+                            ) -> cu29::curuntime::ProcessStepResult {
+                                let clock = step_rt.clock;
+                                let execution_probe = step_rt.execution_probe;
+                                let monitor = step_rt.monitor;
+                                let kf_manager = ParallelKeyFrameAccessor::new(
+                                    step_rt.kf_manager_ptr,
+                                    step_rt.kf_lock,
+                                );
+                                let culist = &mut *step_rt.culist;
+                                let clid = step_rt.clid;
+                                let ctx = &mut step_rt.ctx;
+                                let msgs = &mut culist.msgs.0;
+                                #step_code
+                            }
+                        }
+                    })
+                    .collect();
+            let parallel_stage_worker_spawns: Vec<proc_macro2::TokenStream> =
+                parallel_process_step_idents
+                    .iter()
+                    .enumerate()
+                    .map(|(stage_index, step_ident)| {
+                        let stage_index_lit = syn::Index::from(stage_index);
+                        let receiver_ident =
+                            format_ident!("__cu_parallel_stage_rx_{stage_index}");
+                        quote! {
+                            {
+                                let mut #receiver_ident = stage_receivers
+                                    .next()
+                                    .expect("parallel stage receiver missing");
+                                let mut next_stage_tx = stage_senders.next();
+                                let done_tx = done_tx.clone();
+                                let shutdown = std::sync::Arc::clone(&shutdown);
+                                let clock = clock.clone();
+                                let instance_id = instance_id;
+                                let subsystem_code = subsystem_code;
+                                let execution_probe_ptr = execution_probe_ptr;
+                                let monitor_ptr = monitor_ptr;
+                                let task_ptrs = task_ptrs;
+                                let task_locks = std::sync::Arc::clone(&task_locks);
+                                let bridge_ptrs = bridge_ptrs;
+                                let bridge_locks = std::sync::Arc::clone(&bridge_locks);
+                                let kf_manager_ptr = kf_manager_ptr;
+                                let kf_lock = std::sync::Arc::clone(&kf_lock);
+                                scope.spawn(move || {
+                                    loop {
+                                        let job = match #receiver_ident.recv() {
+                                            Ok(job) => job,
+                                            Err(_) => break,
+                                        };
+                                        let clid = job.clid;
+                                        let culist = job.culist;
 
-        let config_load_stmt = if std {
+                                        let terminal_result = if shutdown.load(Ordering::Acquire) {
+                                            #mission_mod::ParallelWorkerResult {
+                                                clid,
+                                                culist: Some(culist),
+                                                outcome: Err(CuError::from(
+                                                    "Parallel runtime shutting down after an earlier stage failure",
+                                                )),
+                                                raw_payload_bytes: 0,
+                                                handle_bytes: 0,
+                                            }
+                                        } else {
+                                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                let execution_probe = unsafe { execution_probe_ptr.as_ref() };
+                                                let monitor = unsafe { monitor_ptr.as_ref() };
+                                                let mut culist = culist;
+                                                let mut step_rt = #mission_mod::ParallelProcessStepRuntime {
+                                                    clock: &clock,
+                                                    execution_probe,
+                                                    monitor,
+                                                    task_ptrs: &task_ptrs,
+                                                    task_locks: task_locks.as_ref(),
+                                                    bridge_ptrs: &bridge_ptrs,
+                                                    bridge_locks: bridge_locks.as_ref(),
+                                                    kf_manager_ptr,
+                                                    kf_lock: kf_lock.as_ref(),
+                                                    culist: culist.as_mut(),
+                                                    clid,
+                                                    ctx: cu29::context::CuContext::from_runtime_metadata(
+                                                        clock.clone(),
+                                                        clid,
+                                                        instance_id,
+                                                        subsystem_code,
+                                                        #mission_mod::TASK_IDS,
+                                                    ),
+                                                };
+                                                let outcome = #step_ident(&mut step_rt);
+                                                drop(step_rt);
+                                                (culist, outcome)
+                                            })) {
+                                                Ok((culist, Ok(cu29::curuntime::ProcessStepOutcome::Continue))) => {
+                                                    if shutdown.load(Ordering::Acquire) {
+                                                        #mission_mod::ParallelWorkerResult {
+                                                            clid,
+                                                            culist: Some(culist),
+                                                            outcome: Err(CuError::from(
+                                                                "Parallel runtime shutting down after an earlier stage failure",
+                                                            )),
+                                                            raw_payload_bytes: 0,
+                                                            handle_bytes: 0,
+                                                        }
+                                                    } else if let Some(next_stage_tx) = next_stage_tx.as_mut() {
+                                                        let forwarded_job = #mission_mod::ParallelWorkerJob { clid, culist };
+                                                        match next_stage_tx.send(forwarded_job) {
+                                                            Ok(()) => continue,
+                                                            Err(send_error) => {
+                                                                let failed_job = send_error.0;
+                                                                shutdown.store(true, Ordering::Release);
+                                                                #mission_mod::ParallelWorkerResult {
+                                                                    clid,
+                                                                    culist: Some(failed_job.culist),
+                                                                    outcome: Err(CuError::from(format!(
+                                                                        "Parallel stage {} could not hand CopperList #{} to the next stage",
+                                                                        #stage_index_lit,
+                                                                        clid
+                                                                    ))),
+                                                                    raw_payload_bytes: 0,
+                                                                    handle_bytes: 0,
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        #mission_mod::ParallelWorkerResult {
+                                                            clid,
+                                                            culist: Some(culist),
+                                                            outcome: Ok(cu29::curuntime::ProcessStepOutcome::Continue),
+                                                            raw_payload_bytes: 0,
+                                                            handle_bytes: 0,
+                                                        }
+                                                    }
+                                                }
+                                                Ok((culist, Ok(cu29::curuntime::ProcessStepOutcome::AbortCopperList))) => {
+                                                    #mission_mod::ParallelWorkerResult {
+                                                        clid,
+                                                        culist: Some(culist),
+                                                        outcome: Ok(cu29::curuntime::ProcessStepOutcome::AbortCopperList),
+                                                        raw_payload_bytes: 0,
+                                                        handle_bytes: 0,
+                                                    }
+                                                }
+                                                Ok((culist, Err(error))) => {
+                                                    shutdown.store(true, Ordering::Release);
+                                                    #mission_mod::ParallelWorkerResult {
+                                                        clid,
+                                                        culist: Some(culist),
+                                                        outcome: Err(error),
+                                                        raw_payload_bytes: 0,
+                                                        handle_bytes: 0,
+                                                    }
+                                                }
+                                                Err(payload) => {
+                                                    shutdown.store(true, Ordering::Release);
+                                                    let panic_message =
+                                                        cu29::monitoring::panic_payload_to_string(payload.as_ref());
+                                                    #mission_mod::ParallelWorkerResult {
+                                                        clid,
+                                                        culist: None,
+                                                        outcome: Err(CuError::from(format!(
+                                                            "Panic while processing CopperList #{} in stage {}: {}",
+                                                            clid,
+                                                            #stage_index_lit,
+                                                            panic_message
+                                                        ))),
+                                                        raw_payload_bytes: 0,
+                                                        handle_bytes: 0,
+                                                    }
+                                                }
+                                            }
+                                        };
+
+                                        if done_tx.send(terminal_result).is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    })
+                    .collect();
+            (
+                parallel_process_step_idents,
+                parallel_process_step_fn_defs,
+                parallel_stage_worker_spawns,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let parallel_process_stage_count_tokens =
+            proc_macro2::Literal::usize_unsuffixed(parallel_process_step_idents.len());
+        let parallel_task_ptrs_type = if task_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = task_types
+                .iter()
+                .map(|ty| quote! { ParallelSharedPtr<#ty> });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_task_locks_type = if task_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = (0..task_types.len()).map(|_| quote! { std::sync::Mutex<()> });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_task_ptr_values = if task_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = (0..task_types.len()).map(|index| {
+                let index = syn::Index::from(index);
+                quote! { ParallelSharedPtr::new(&mut runtime.tasks.#index as *mut _) }
+            });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_task_lock_values = if task_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = (0..task_types.len()).map(|_| quote! { std::sync::Mutex::new(()) });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_bridge_ptrs_type = if bridge_runtime_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = bridge_runtime_types
+                .iter()
+                .map(|ty| quote! { ParallelSharedPtr<#ty> });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_bridge_locks_type = if bridge_runtime_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = (0..bridge_runtime_types.len()).map(|_| quote! { std::sync::Mutex<()> });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_bridge_ptr_values = if bridge_runtime_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems = (0..bridge_runtime_types.len()).map(|index| {
+                let index = syn::Index::from(index);
+                quote! { ParallelSharedPtr::new(&mut runtime.bridges.#index as *mut _) }
+            });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_bridge_lock_values = if bridge_runtime_types.is_empty() {
+            quote! { () }
+        } else {
+            let elems =
+                (0..bridge_runtime_types.len()).map(|_| quote! { std::sync::Mutex::new(()) });
+            quote! { (#(#elems),*,) }
+        };
+        let parallel_rt_support_tokens = if parallel_rt_run_supported {
             quote! {
-                let (config, config_source) = if let Some(overridden_config) = config_override {
-                    debug!("CuConfig: Overridden programmatically.");
-                    (overridden_config, RuntimeLifecycleConfigSource::ProgrammaticOverride)
-                } else if ::std::path::Path::new(config_filename).exists() {
-                    debug!("CuConfig: Reading configuration from file: {}", config_filename);
-                    (
-                        cu29::config::read_configuration(config_filename)?,
-                        RuntimeLifecycleConfigSource::ExternalFile,
-                    )
-                } else {
-                    let original_config = Self::original_config();
-                    debug!("CuConfig: Using the bundled configuration compiled into the binary.");
-                    (
-                        cu29::config::read_configuration_str(original_config, None)?,
-                        RuntimeLifecycleConfigSource::BundledDefault,
-                    )
-                };
+                type ParallelTaskPtrs = #parallel_task_ptrs_type;
+                type ParallelTaskLocks = #parallel_task_locks_type;
+                type ParallelBridgePtrs = #parallel_bridge_ptrs_type;
+                type ParallelBridgeLocks = #parallel_bridge_locks_type;
+
+                struct ParallelSharedPtr<T>(*mut T);
+
+                impl<T> Clone for ParallelSharedPtr<T> {
+                    #[inline(always)]
+                    fn clone(&self) -> Self {
+                        *self
+                    }
+                }
+
+                impl<T> Copy for ParallelSharedPtr<T> {}
+
+                impl<T> ParallelSharedPtr<T> {
+                    #[inline(always)]
+                    const fn new(ptr: *mut T) -> Self {
+                        Self(ptr)
+                    }
+
+                    #[inline(always)]
+                    const fn from_ref(ptr: *const T) -> Self {
+                        Self(ptr as *mut T)
+                    }
+
+                    #[inline(always)]
+                    unsafe fn as_mut<'a>(self) -> &'a mut T {
+                        unsafe { &mut *self.0 }
+                    }
+
+                    #[inline(always)]
+                    unsafe fn as_ref<'a>(self) -> &'a T {
+                        unsafe { &*self.0 }
+                    }
+                }
+
+                unsafe impl<T: Send> Send for ParallelSharedPtr<T> {}
+                unsafe impl<T: Send> Sync for ParallelSharedPtr<T> {}
+
+                struct ParallelKeyFrameAccessor<'a> {
+                    ptr: ParallelSharedPtr<cu29::curuntime::KeyFramesManager>,
+                    lock: &'a std::sync::Mutex<()>,
+                }
+
+                impl<'a> ParallelKeyFrameAccessor<'a> {
+                    #[inline(always)]
+                    fn new(
+                        ptr: ParallelSharedPtr<cu29::curuntime::KeyFramesManager>,
+                        lock: &'a std::sync::Mutex<()>,
+                    ) -> Self {
+                        Self { ptr, lock }
+                    }
+
+                    #[inline(always)]
+                    fn freeze_task(
+                        &self,
+                        culistid: u64,
+                        task: &impl cu29::cutask::Freezable,
+                    ) -> CuResult<usize> {
+                        let _guard = self.lock.lock().expect("parallel keyframe lock poisoned");
+                        let manager = unsafe { self.ptr.as_mut() };
+                        manager.freeze_task(culistid, task)
+                    }
+
+                    #[inline(always)]
+                    fn freeze_any(
+                        &self,
+                        culistid: u64,
+                        item: &impl cu29::cutask::Freezable,
+                    ) -> CuResult<usize> {
+                        let _guard = self.lock.lock().expect("parallel keyframe lock poisoned");
+                        let manager = unsafe { self.ptr.as_mut() };
+                        manager.freeze_any(culistid, item)
+                    }
+                }
+
+                struct ParallelProcessStepRuntime<'a> {
+                    clock: &'a RobotClock,
+                    execution_probe: &'a cu29::monitoring::RuntimeExecutionProbe,
+                    monitor: &'a #monitor_type,
+                    task_ptrs: &'a ParallelTaskPtrs,
+                    task_locks: &'a ParallelTaskLocks,
+                    bridge_ptrs: &'a ParallelBridgePtrs,
+                    bridge_locks: &'a ParallelBridgeLocks,
+                    kf_manager_ptr: ParallelSharedPtr<cu29::curuntime::KeyFramesManager>,
+                    kf_lock: &'a std::sync::Mutex<()>,
+                    culist: &'a mut CuList,
+                    clid: u64,
+                    ctx: cu29::context::CuContext,
+                }
+
+                struct ParallelWorkerJob {
+                    clid: u64,
+                    culist: Box<CuList>,
+                }
+
+                struct ParallelWorkerResult {
+                    clid: u64,
+                    culist: Option<Box<CuList>>,
+                    outcome: cu29::curuntime::ProcessStepResult,
+                    raw_payload_bytes: u64,
+                    handle_bytes: u64,
+                }
+
+                #[inline(always)]
+                fn assert_parallel_rt_send_bounds()
+                where
+                    CuList: Send,
+                    #process_step_tasks_type: Send,
+                    CuBridges: Send,
+                    #monitor_type: Sync,
+                {
+                }
+
+                #(#parallel_process_step_fn_defs)*
             }
         } else {
-            quote! {
-                // Only the original config is available in no-std
-                let original_config = Self::original_config();
-                debug!("CuConfig: Using the bundled configuration compiled into the binary.");
-                let config = cu29::config::read_configuration_str(original_config, None)?;
-                let config_source = RuntimeLifecycleConfigSource::BundledDefault;
+            quote! {}
+        };
+
+        let config_load_stmt =
+            build_config_load_stmt(std, application_name, subsystem_id.as_deref());
+
+        let copperlist_count_check = quote! {
+            let configured_copperlist_count = config
+                .logging
+                .as_ref()
+                .and_then(|logging| logging.copperlist_count)
+                .unwrap_or(#copperlist_count_tokens);
+            if configured_copperlist_count != #copperlist_count_tokens {
+                return Err(CuError::from(format!(
+                    "Configured logging.copperlist_count ({configured_copperlist_count}) does not match the runtime compiled into this binary ({})",
+                    #copperlist_count_tokens
+                )));
             }
         };
 
-        let init_resources_sig = if std {
+        let prepare_config_sig = if std {
             quote! {
-                pub fn init_resources(config_override: Option<CuConfig>) -> CuResult<AppResources>
+                fn prepare_config(
+                    instance_id: u32,
+                    config_override: Option<CuConfig>,
+                ) -> CuResult<(CuConfig, RuntimeLifecycleConfigSource)>
             }
         } else {
             quote! {
-                pub fn init_resources() -> CuResult<AppResources>
+                fn prepare_config() -> CuResult<(CuConfig, RuntimeLifecycleConfigSource)>
             }
         };
 
-        let init_resources_call = if std {
-            quote! { Self::init_resources(config_override)? }
+        let prepare_config_call = if std {
+            quote! { Self::prepare_config(instance_id, config_override)? }
         } else {
-            quote! { Self::init_resources()? }
+            quote! { Self::prepare_config()? }
         };
 
-        let new_with_resources_sig = if sim_mode {
+        let prepare_resources_sig = if std {
             quote! {
-                pub fn new_with_resources<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>(
+                pub fn prepare_resources_for_instance(
+                    instance_id: u32,
+                    config_override: Option<CuConfig>,
+                ) -> CuResult<AppResources>
+            }
+        } else {
+            quote! {
+                pub fn prepare_resources() -> CuResult<AppResources>
+            }
+        };
+
+        let prepare_resources_compat_fn = if std {
+            Some(quote! {
+                pub fn prepare_resources(
+                    config_override: Option<CuConfig>,
+                ) -> CuResult<AppResources> {
+                    Self::prepare_resources_for_instance(0, config_override)
+                }
+            })
+        } else {
+            None
+        };
+
+        let init_resources_compat_fn = if std {
+            Some(quote! {
+                pub fn init_resources_for_instance(
+                    instance_id: u32,
+                    config_override: Option<CuConfig>,
+                ) -> CuResult<AppResources> {
+                    Self::prepare_resources_for_instance(instance_id, config_override)
+                }
+
+                pub fn init_resources(
+                    config_override: Option<CuConfig>,
+                ) -> CuResult<AppResources> {
+                    Self::prepare_resources(config_override)
+                }
+            })
+        } else {
+            Some(quote! {
+                pub fn init_resources() -> CuResult<AppResources> {
+                    Self::prepare_resources()
+                }
+            })
+        };
+
+        let build_with_resources_sig = if sim_mode {
+            quote! {
+                fn build_with_resources<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>(
                     clock: RobotClock,
                     unified_logger: Arc<Mutex<L>>,
                     app_resources: AppResources,
+                    instance_id: u32,
                     sim_callback: &mut impl FnMut(SimStep) -> SimOverride,
                 ) -> CuResult<Self>
             }
         } else {
             quote! {
-                pub fn new_with_resources<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>(
+                fn build_with_resources<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>(
                     clock: RobotClock,
                     unified_logger: Arc<Mutex<L>>,
                     app_resources: AppResources,
+                    instance_id: u32,
                 ) -> CuResult<Self>
             }
         };
-
-        let new_with_resources_call = if sim_mode {
-            quote! { Self::new_with_resources(clock, unified_logger, app_resources, sim_callback) }
+        let parallel_rt_metadata_arg = if std && parallel_rt_enabled {
+            Some(quote! {
+                &#mission_mod::PARALLEL_RT_METADATA,
+            })
         } else {
-            quote! { Self::new_with_resources(clock, unified_logger, app_resources) }
+            None
         };
 
         let kill_handler = if std && signal_handler {
@@ -2453,9 +3430,17 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         };
 
         let run_loop = if std {
-            quote! {
+            quote! {{
+                let mut rate_limiter = self
+                    .copper_runtime
+                    .runtime_config
+                    .rate_target_hz
+                    .map(|rate| cu29::curuntime::LoopRateLimiter::from_rate_target_hz(
+                        rate,
+                        self.copper_runtime.clock_ref(),
+                    ))
+                    .transpose()?;
                 loop  {
-                    let iter_start = self.copper_runtime.clock.now();
                     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                         || <Self as #app_trait<S, L>>::run_one_iteration(self, #sim_callback_arg)
                     )) {
@@ -2476,80 +3461,452 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                         }
                     };
 
-                    if let Some(rate) = self.copper_runtime.runtime_config.rate_target_hz {
-                        let period: CuDuration = (1_000_000_000u64 / rate).into();
-                        let elapsed = self.copper_runtime.clock.now() - iter_start;
-                        if elapsed < period {
-                            std::thread::sleep(std::time::Duration::from_nanos(period.as_nanos() - elapsed.as_nanos()));
-                        }
+                    if let Some(rate_limiter) = rate_limiter.as_mut() {
+                        rate_limiter.limit(self.copper_runtime.clock_ref());
                     }
 
                     if STOP_FLAG.load(Ordering::SeqCst) || result.is_err() {
                         break result;
                     }
                 }
-            }
+            }}
         } else {
-            quote! {
+            quote! {{
+                let mut rate_limiter = self
+                    .copper_runtime
+                    .runtime_config
+                    .rate_target_hz
+                    .map(|rate| cu29::curuntime::LoopRateLimiter::from_rate_target_hz(
+                        rate,
+                        self.copper_runtime.clock_ref(),
+                    ))
+                    .transpose()?;
                 loop  {
-                    let iter_start = self.copper_runtime.clock.now();
                     let result = <Self as #app_trait<S, L>>::run_one_iteration(self, #sim_callback_arg);
-                    if let Some(rate) = self.copper_runtime.runtime_config.rate_target_hz {
-                        let period: CuDuration = (1_000_000_000u64 / rate).into();
-                        let elapsed = self.copper_runtime.clock.now() - iter_start;
-                        if elapsed < period {
-                            busy_wait_for(period - elapsed);
-                        }
+                    if let Some(rate_limiter) = rate_limiter.as_mut() {
+                        rate_limiter.limit(self.copper_runtime.clock_ref());
                     }
 
                     if STOP_FLAG.load(Ordering::SeqCst) || result.is_err() {
                         break result;
                     }
                 }
-            }
+            }}
         };
 
         #[cfg(feature = "macro_debug")]
         eprintln!("[build the run methods]");
+        let run_body: proc_macro2::TokenStream = if parallel_rt_run_supported {
+            quote! {
+                static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+
+                #kill_handler
+
+                <Self as #app_trait<S, L>>::start_all_tasks(self)?;
+                let result = std::thread::scope(|scope| -> CuResult<()> {
+                    #mission_mod::assert_parallel_rt_send_bounds();
+
+                    let runtime = &mut self.copper_runtime;
+                    let clock_handle = runtime.clock();
+                    let clock = &clock_handle;
+                    let instance_id = runtime.instance_id();
+                    let subsystem_code = runtime.subsystem_code();
+                    let execution_probe = runtime.execution_probe.as_ref();
+                    let monitor = &runtime.monitor;
+                    let cl_manager = &mut runtime.copperlists_manager;
+                    let parallel_rt = &runtime.parallel_rt;
+                    let execution_probe_ptr =
+                        #mission_mod::ParallelSharedPtr::from_ref(execution_probe as *const _);
+                    let monitor_ptr =
+                        #mission_mod::ParallelSharedPtr::from_ref(monitor as *const _);
+                    let task_ptrs: #mission_mod::ParallelTaskPtrs = #parallel_task_ptr_values;
+                    let task_locks = std::sync::Arc::new(#parallel_task_lock_values);
+                    let bridge_ptrs: #mission_mod::ParallelBridgePtrs = #parallel_bridge_ptr_values;
+                    let bridge_locks = std::sync::Arc::new(#parallel_bridge_lock_values);
+                    let kf_manager_ptr =
+                        #mission_mod::ParallelSharedPtr::new(&mut runtime.keyframes_manager as *mut _);
+                    let kf_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+                    let mut free_copperlists =
+                        cu29::curuntime::allocate_boxed_copperlists::<CuStampedDataSet, #copperlist_count_tokens>();
+                    let start_clid = cl_manager.next_cl_id();
+                    parallel_rt.reset_cursors(start_clid);
+
+                    let stage_count = #parallel_process_stage_count_tokens;
+                    debug_assert_eq!(parallel_rt.metadata().process_stage_count(), stage_count);
+                    if stage_count == 0 {
+                        return Err(CuError::from(
+                            "Parallel runtime requires at least one generated process stage",
+                        ));
+                    }
+
+                    let queue_capacity = parallel_rt.in_flight_limit().max(1);
+                    let mut stage_senders = Vec::with_capacity(stage_count);
+                    let mut stage_receivers = Vec::with_capacity(stage_count);
+                    for _stage_index in 0..stage_count {
+                        let (stage_tx, stage_rx) =
+                            cu29::parallel_queue::stage_queue::<#mission_mod::ParallelWorkerJob>(
+                                queue_capacity,
+                            );
+                        stage_senders.push(stage_tx);
+                        stage_receivers.push(stage_rx);
+                    }
+                    let (done_tx, done_rx) =
+                        std::sync::mpsc::channel::<#mission_mod::ParallelWorkerResult>();
+                    let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+                    let mut stage_senders = stage_senders.into_iter();
+                    let mut entry_stage_tx = stage_senders
+                        .next()
+                        .expect("parallel stage pipeline has no entry queue");
+                    let mut stage_receivers = stage_receivers.into_iter();
+                    #(#parallel_stage_worker_spawns)*
+                    drop(done_tx);
+
+                    let mut dispatch_limiter = runtime
+                        .runtime_config
+                        .rate_target_hz
+                        .map(|rate| cu29::curuntime::LoopRateLimiter::from_rate_target_hz(rate, clock))
+                        .transpose()?;
+                    let mut in_flight = 0usize;
+                    let mut stop_launching = false;
+                    let mut next_launch_clid = start_clid;
+                    let mut next_commit_clid = start_clid;
+                    let mut pending_results =
+                        std::collections::BTreeMap::<u64, #mission_mod::ParallelWorkerResult>::new();
+                    let mut active_keyframe_clid: Option<u64> = None;
+                    let mut fatal_error: Option<CuError> = None;
+
+                    loop {
+                        while let Some(recycled_culist) = cl_manager.try_reclaim_boxed()? {
+                            free_copperlists.push(recycled_culist);
+                        }
+
+                        if !stop_launching && fatal_error.is_none() {
+                            let next_clid = next_launch_clid;
+                            let rate_ready = dispatch_limiter
+                                .as_ref()
+                                .map(|limiter| limiter.is_ready(clock))
+                                .unwrap_or(true);
+                            let keyframe_ready = {
+                                let _keyframe_lock = kf_lock.lock().expect("parallel keyframe lock poisoned");
+                                let kf_manager = unsafe { kf_manager_ptr.as_mut() };
+                                active_keyframe_clid.is_none() || !kf_manager.captures_keyframe(next_clid)
+                            };
+
+                            if in_flight < parallel_rt.in_flight_limit()
+                                && rate_ready
+                                && keyframe_ready
+                                && !free_copperlists.is_empty()
+                            {
+                                // Parallel lifecycle is attached to component-local stage work,
+                                // so dispatch itself can launch the next CopperList immediately.
+                                let should_launch = true;
+
+                                if should_launch {
+                                    let mut culist = free_copperlists
+                                        .pop()
+                                        .expect("parallel CopperList pool unexpectedly empty");
+                                    let clid = next_clid;
+                                    culist.id = clid;
+                                    culist.change_state(cu29::copperlist::CopperListState::Initialized);
+                                    {
+                                        let _keyframe_lock =
+                                            kf_lock.lock().expect("parallel keyframe lock poisoned");
+                                        let kf_manager = unsafe { kf_manager_ptr.as_mut() };
+                                        kf_manager.reset(clid, clock);
+                                        if kf_manager.captures_keyframe(clid) {
+                                            active_keyframe_clid = Some(clid);
+                                        }
+                                    }
+                                    culist.change_state(cu29::copperlist::CopperListState::Processing);
+                                    culist.msgs.init_zeroed();
+                                    entry_stage_tx
+                                        .send(#mission_mod::ParallelWorkerJob {
+                                            clid,
+                                            culist,
+                                        })
+                                        .map_err(|e| {
+                                            shutdown.store(true, Ordering::Release);
+                                            CuError::from("Failed to enqueue CopperList for parallel stage processing")
+                                                .add_cause(e.to_string().as_str())
+                                        })?;
+                                    next_launch_clid += 1;
+                                    in_flight += 1;
+                                    if let Some(limiter) = dispatch_limiter.as_mut() {
+                                        limiter.mark_tick(clock);
+                                    }
+                                }
+
+                                if STOP_FLAG.load(Ordering::SeqCst) {
+                                    stop_launching = true;
+                                }
+                                continue;
+                            }
+                        }
+
+                        if in_flight == 0 {
+                            if stop_launching || fatal_error.is_some() {
+                                break;
+                            }
+
+                            if free_copperlists.is_empty() {
+                                free_copperlists.push(cl_manager.wait_reclaim_boxed()?);
+                                continue;
+                            }
+
+                            if let Some(limiter) = dispatch_limiter.as_ref()
+                                && !limiter.is_ready(clock)
+                            {
+                                limiter.wait_until_ready(clock);
+                                continue;
+                            }
+                        }
+
+                        let recv_result = if !stop_launching && fatal_error.is_none() {
+                            if let Some(limiter) = dispatch_limiter.as_ref() {
+                                if let Some(remaining) = limiter.remaining(clock)
+                                    && in_flight > 0
+                                {
+                                    done_rx.recv_timeout(std::time::Duration::from(remaining))
+                                } else {
+                                    done_rx
+                                        .recv()
+                                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                                }
+                            } else {
+                                done_rx
+                                    .recv()
+                                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                            }
+                        } else {
+                            done_rx
+                                .recv()
+                                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                        };
+
+                        let worker_result = match recv_result {
+                            Ok(worker_result) => worker_result,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if STOP_FLAG.load(Ordering::SeqCst) {
+                                    stop_launching = true;
+                                }
+                                continue;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                shutdown.store(true, Ordering::Release);
+                                return Err(CuError::from(
+                                    "Parallel stage worker disconnected unexpectedly",
+                                ));
+                            }
+                        };
+                        in_flight = in_flight.saturating_sub(1);
+                        pending_results.insert(worker_result.clid, worker_result);
+
+                        while let Some(worker_result) = pending_results.remove(&next_commit_clid) {
+                            if fatal_error.is_none()
+                                && parallel_rt.current_commit_clid() != worker_result.clid
+                            {
+                                shutdown.store(true, Ordering::Release);
+                                fatal_error = Some(CuError::from(format!(
+                                    "Parallel commit checkpoint out of sync: expected {}, got {}",
+                                    parallel_rt.current_commit_clid(),
+                                    worker_result.clid
+                                )));
+                                stop_launching = true;
+                            }
+
+                            let mut worker_result = worker_result;
+                            if fatal_error.is_none() {
+                                match worker_result.outcome {
+                                    Ok(cu29::curuntime::ProcessStepOutcome::AbortCopperList) => {
+                                        let mut culist = worker_result
+                                            .culist
+                                            .take()
+                                            .expect("parallel abort result missing CopperList ownership");
+                                        let mut commit_ctx = cu29::context::CuContext::from_runtime_metadata(
+                                            clock.clone(),
+                                            worker_result.clid,
+                                            instance_id,
+                                            subsystem_code,
+                                            #mission_mod::TASK_IDS,
+                                        );
+                                        commit_ctx.clear_current_task();
+                                        let monitor_result = monitor.process_copperlist(
+                                            &commit_ctx,
+                                            #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)),
+                                        );
+                                        match cl_manager.end_of_processing_boxed(culist)? {
+                                            cu29::curuntime::OwnedCopperListSubmission::Recycled(culist) => {
+                                                free_copperlists.push(culist);
+                                            }
+                                            cu29::curuntime::OwnedCopperListSubmission::Pending => {}
+                                        }
+                                        monitor_result?;
+                                    }
+                                    Ok(cu29::curuntime::ProcessStepOutcome::Continue) => {
+                                        let mut culist = worker_result
+                                            .culist
+                                            .take()
+                                            .expect("parallel worker result missing CopperList ownership");
+                                        let mut commit_ctx = cu29::context::CuContext::from_runtime_metadata(
+                                            clock.clone(),
+                                            worker_result.clid,
+                                            instance_id,
+                                            subsystem_code,
+                                            #mission_mod::TASK_IDS,
+                                        );
+                                        commit_ctx.clear_current_task();
+                                        let monitor_result = monitor.process_copperlist(
+                                            &commit_ctx,
+                                            #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)),
+                                        );
+
+                                        #(#preprocess_logging_calls)*
+
+                                        match cl_manager.end_of_processing_boxed(culist)? {
+                                            cu29::curuntime::OwnedCopperListSubmission::Recycled(culist) => {
+                                                free_copperlists.push(culist);
+                                            }
+                                            cu29::curuntime::OwnedCopperListSubmission::Pending => {}
+                                        }
+                                        let keyframe_bytes = {
+                                            let _keyframe_lock =
+                                                kf_lock.lock().expect("parallel keyframe lock poisoned");
+                                            let kf_manager = unsafe { kf_manager_ptr.as_mut() };
+                                            kf_manager.end_of_processing(worker_result.clid)?;
+                                            kf_manager.last_encoded_bytes
+                                        };
+                                        monitor_result?;
+                                        let stats = cu29::monitoring::CopperListIoStats {
+                                            raw_culist_bytes: core::mem::size_of::<CuList>() as u64
+                                                + cl_manager.last_handle_bytes,
+                                            handle_bytes: cl_manager.last_handle_bytes,
+                                            encoded_culist_bytes: cl_manager.last_encoded_bytes,
+                                            keyframe_bytes,
+                                            structured_log_bytes_total: ::cu29::prelude::structured_log_bytes_total(),
+                                            culistid: worker_result.clid,
+                                        };
+                                        monitor.observe_copperlist_io(stats);
+
+                                        // Postprocess, when present, now runs inside the owning
+                                        // component stage instead of on the ordered commit path.
+                                    }
+                                    Err(error) => {
+                                        shutdown.store(true, Ordering::Release);
+                                        stop_launching = true;
+                                        fatal_error = Some(error);
+                                        if let Some(mut culist) = worker_result.culist.take() {
+                                            culist.change_state(cu29::copperlist::CopperListState::Free);
+                                            free_copperlists.push(culist);
+                                        }
+                                    }
+                                }
+                            } else if let Some(mut culist) = worker_result.culist.take() {
+                                culist.change_state(cu29::copperlist::CopperListState::Free);
+                                free_copperlists.push(culist);
+                            }
+
+                            if active_keyframe_clid == Some(worker_result.clid) {
+                                active_keyframe_clid = None;
+                            }
+                            parallel_rt.release_commit(worker_result.clid + 1);
+                            next_commit_clid += 1;
+                        }
+
+                        if STOP_FLAG.load(Ordering::SeqCst) {
+                            stop_launching = true;
+                        }
+                    }
+
+                    drop(entry_stage_tx);
+                    free_copperlists.extend(cl_manager.finish_pending_boxed()?);
+                    if let Some(error) = fatal_error {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    }
+                });
+
+                if result.is_err() {
+                    error!("A task errored out: {}", &result);
+                }
+                <Self as #app_trait<S, L>>::stop_all_tasks(self, #sim_callback_arg)?;
+                let _ = self.log_shutdown_completed();
+                result
+            }
+        } else {
+            quote! {
+                static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+
+                #kill_handler
+
+                <Self as #app_trait<S, L>>::start_all_tasks(self, #sim_callback_arg)?;
+                let result = #run_loop;
+
+                if result.is_err() {
+                    error!("A task errored out: {}", &result);
+                }
+                <Self as #app_trait<S, L>>::stop_all_tasks(self, #sim_callback_arg)?;
+                let _ = self.log_shutdown_completed();
+                result
+            }
+        };
         let run_methods: proc_macro2::TokenStream = quote! {
 
             #run_one_iteration {
 
                 // Pre-explode the runtime to avoid complexity with partial borrowing in the generated code.
                 let runtime = &mut self.copper_runtime;
-                let clock = &runtime.clock;
+                let clock_handle = runtime.clock();
+                let clock = &clock_handle;
+                let instance_id = runtime.instance_id();
+                let subsystem_code = runtime.subsystem_code();
                 let execution_probe = &runtime.execution_probe;
                 let monitor = &mut runtime.monitor;
                 let tasks = &mut runtime.tasks;
                 let __cu_bridges = &mut runtime.bridges;
                 let cl_manager = &mut runtime.copperlists_manager;
                 let kf_manager = &mut runtime.keyframes_manager;
-                let iteration_clid = cl_manager.inner.next_cl_id();
-                let mut ctx = cu29::context::CuContext::builder(clock.clone())
-                    .cl_id(iteration_clid)
-                    .task_ids(#mission_mod::TASK_IDS)
-                    .build();
+                let iteration_clid = cl_manager.next_cl_id();
+                let mut ctx = cu29::context::CuContext::from_runtime_metadata(
+                    clock.clone(),
+                    iteration_clid,
+                    instance_id,
+                    subsystem_code,
+                    #mission_mod::TASK_IDS,
+                );
+                let mut __cu_abort_copperlist = false;
 
                 // Preprocess calls can happen at any time, just packed them up front.
                 #(#preprocess_calls)*
 
-                let culist = cl_manager.inner.create().expect("Ran out of space for copper lists"); // FIXME: error handling
+                let culist = cl_manager.create()?;
                 let clid = culist.id;
                 debug_assert_eq!(clid, iteration_clid);
                 kf_manager.reset(clid, clock); // beginning of processing, we empty the serialized frozen states of the tasks.
                 culist.change_state(cu29::copperlist::CopperListState::Processing);
                 culist.msgs.init_zeroed();
-                let mut ctx = cu29::context::CuContext::builder(clock.clone())
-                    .cl_id(iteration_clid)
-                    .task_ids(#mission_mod::TASK_IDS)
-                    .build();
+                let mut ctx = cu29::context::CuContext::from_runtime_metadata(
+                    clock.clone(),
+                    iteration_clid,
+                    instance_id,
+                    subsystem_code,
+                    #mission_mod::TASK_IDS,
+                );
                 {
                     let msgs = &mut culist.msgs.0;
+                    '__cu_process_steps: {
                     #(#runtime_plan_code)*
+                    }
                 } // drop(msgs);
-                let (raw_payload_bytes, handle_bytes) = #mission_mod::compute_payload_bytes(&culist);
+                if __cu_abort_copperlist {
+                    ctx.clear_current_task();
+                    let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
+                    cl_manager.end_of_processing(clid)?;
+                    monitor_result?;
+                    return Ok(());
+                }
                 ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
+                let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
 
                 // here drop the payloads if we don't want them to be logged.
                 #(#preprocess_logging_calls)*
@@ -2558,8 +3915,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 kf_manager.end_of_processing(clid)?;
                 monitor_result?;
                 let stats = cu29::monitoring::CopperListIoStats {
-                    raw_culist_bytes: core::mem::size_of::<CuList>() as u64 + raw_payload_bytes,
-                    handle_bytes,
+                    raw_culist_bytes: core::mem::size_of::<CuList>() as u64 + cl_manager.last_handle_bytes,
+                    handle_bytes: cl_manager.last_handle_bytes,
                     encoded_culist_bytes: cl_manager.last_encoded_bytes,
                     keyframe_bytes: kf_manager.last_encoded_bytes,
                     structured_log_bytes_total: ::cu29::prelude::structured_log_bytes_total(),
@@ -2574,7 +3931,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
 
             fn restore_keyframe(&mut self, keyframe: &KeyFrame) -> CuResult<()> {
                 let runtime = &mut self.copper_runtime;
-                let clock = &runtime.clock;
+                let clock_handle = runtime.clock();
+                let clock = &clock_handle;
                 let tasks = &mut runtime.tasks;
                 let __cu_bridges = &mut runtime.bridges;
                 let config = cu29::bincode::config::standard();
@@ -2589,11 +3947,14 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 let _ = self.log_runtime_lifecycle_event(RuntimeLifecycleEvent::MissionStarted {
                     mission: #mission.to_string(),
                 });
-                let lifecycle_clid = self.copper_runtime.copperlists_manager.inner.last_cl_id();
-                let mut ctx = cu29::context::CuContext::builder(self.copper_runtime.clock.clone())
-                    .cl_id(lifecycle_clid)
-                    .task_ids(#mission_mod::TASK_IDS)
-                    .build();
+                let lifecycle_clid = self.copper_runtime.copperlists_manager.last_cl_id();
+                let mut ctx = cu29::context::CuContext::from_runtime_metadata(
+                    self.copper_runtime.clock(),
+                    lifecycle_clid,
+                    self.copper_runtime.instance_id(),
+                    self.copper_runtime.subsystem_code(),
+                    #mission_mod::TASK_IDS,
+                );
                 #(#start_calls)*
                 ctx.clear_current_task();
                 self.copper_runtime.monitor.start(&ctx)?;
@@ -2601,14 +3962,18 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             }
 
             #stop_all_tasks {
-                let lifecycle_clid = self.copper_runtime.copperlists_manager.inner.last_cl_id();
-                let mut ctx = cu29::context::CuContext::builder(self.copper_runtime.clock.clone())
-                    .cl_id(lifecycle_clid)
-                    .task_ids(#mission_mod::TASK_IDS)
-                    .build();
+                let lifecycle_clid = self.copper_runtime.copperlists_manager.last_cl_id();
+                let mut ctx = cu29::context::CuContext::from_runtime_metadata(
+                    self.copper_runtime.clock(),
+                    lifecycle_clid,
+                    self.copper_runtime.instance_id(),
+                    self.copper_runtime.subsystem_code(),
+                    #mission_mod::TASK_IDS,
+                );
                 #(#stop_calls)*
                 ctx.clear_current_task();
                 self.copper_runtime.monitor.stop(&ctx)?;
+                self.copper_runtime.copperlists_manager.finish_pending()?;
                 // TODO(lifecycle): emit typed stop reasons (completed/error/panic/requested)
                 // once panic/reporting flow is finalized for std and no-std.
                 let _ = self.log_runtime_lifecycle_event(RuntimeLifecycleEvent::MissionStopped {
@@ -2619,19 +3984,7 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             }
 
             #run {
-                static STOP_FLAG: AtomicBool = AtomicBool::new(false);
-
-                #kill_handler
-
-                <Self as #app_trait<S, L>>::start_all_tasks(self, #sim_callback_arg)?;
-                let result = #run_loop;
-
-                if result.is_err() {
-                    error!("A task errored out: {}", &result);
-                }
-                <Self as #app_trait<S, L>>::stop_all_tasks(self, #sim_callback_arg)?;
-                let _ = self.log_shutdown_completed();
-                result
+                #run_body
             }
         };
 
@@ -2661,6 +4014,16 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             quote!()
         };
 
+        let mission_id_method = if sim_mode {
+            quote! {
+                fn mission_id() -> Option<&'static str> {
+                    Some(#mission)
+                }
+            }
+        } else {
+            quote!()
+        };
+
         let app_resources_struct = quote! {
             pub struct AppResources {
                 pub config: CuConfig,
@@ -2669,8 +4032,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             }
         };
 
-        let init_resources_fn = quote! {
-            #init_resources_sig {
+        let prepare_config_fn = quote! {
+            #prepare_config_sig {
                 let config_filename = #config_file;
 
                 #[cfg(target_os = "none")]
@@ -2678,6 +4041,7 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 #[cfg(target_os = "none")]
                 ::cu29::prelude::info!("CuApp init: loading config");
                 #config_load_stmt
+                #copperlist_count_check
                 #[cfg(target_os = "none")]
                 ::cu29::prelude::info!("CuApp init: config loaded");
                 if let Some(runtime) = &config.runtime {
@@ -2690,6 +4054,14 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                     #[cfg(target_os = "none")]
                     ::cu29::prelude::info!("CuApp init: rate_target_hz=none");
                 }
+
+                Ok((config, config_source))
+            }
+        };
+
+        let prepare_resources_fn = quote! {
+            #prepare_resources_sig {
+                let (config, config_source) = #prepare_config_call;
 
                 #[cfg(target_os = "none")]
                 ::cu29::prelude::info!("CuApp init: building resources");
@@ -2705,30 +4077,58 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             }
         };
 
-        let new_with_resources_fn = quote! {
-            #new_with_resources_sig {
+        let new_with_resources_compat_fn = if sim_mode {
+            quote! {
+                pub fn new_with_resources<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>(
+                    clock: RobotClock,
+                    unified_logger: Arc<Mutex<L>>,
+                    app_resources: AppResources,
+                    instance_id: u32,
+                    sim_callback: &mut impl FnMut(SimStep) -> SimOverride,
+                ) -> CuResult<Self> {
+                    Self::build_with_resources(
+                        clock,
+                        unified_logger,
+                        app_resources,
+                        instance_id,
+                        sim_callback,
+                    )
+                }
+            }
+        } else {
+            quote! {
+                pub fn new_with_resources<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>(
+                    clock: RobotClock,
+                    unified_logger: Arc<Mutex<L>>,
+                    app_resources: AppResources,
+                    instance_id: u32,
+                ) -> CuResult<Self> {
+                    Self::build_with_resources(clock, unified_logger, app_resources, instance_id)
+                }
+            }
+        };
+
+        let build_with_resources_fn = quote! {
+            #build_with_resources_sig {
                 let AppResources {
                     config,
                     config_source,
                     resources,
                 } = app_resources;
 
-                #[cfg(target_os = "none")]
-                {
-                    let structured_stream = ::cu29::prelude::stream_write::<
-                        ::cu29::prelude::CuLogEntry,
-                        S,
-                    >(
-                        unified_logger.clone(),
-                        ::cu29::prelude::UnifiedLogType::StructuredLogLine,
-                        4096 * 10,
-                    )?;
-                    let _logger_runtime = ::cu29::prelude::LoggerRuntime::init(
-                        clock.clone(),
-                        structured_stream,
-                        None::<::cu29::prelude::NullLog>,
-                    );
-                }
+                let structured_stream = ::cu29::prelude::stream_write::<
+                    ::cu29::prelude::CuLogEntry,
+                    S,
+                >(
+                    unified_logger.clone(),
+                    ::cu29::prelude::UnifiedLogType::StructuredLogLine,
+                    4096 * 10,
+                )?;
+                let logger_runtime = ::cu29::prelude::LoggerRuntime::init(
+                    clock.clone(),
+                    structured_stream,
+                    None::<::cu29::prelude::NullLog>,
+                );
 
                 // For simple cases we can say the section is just a bunch of Copper Lists.
                 // But we can now have allocations outside of it so we can override it from the config.
@@ -2776,11 +4176,15 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 let effective_config_ron = config
                     .serialize_ron()
                     .unwrap_or_else(|_| "<failed to serialize config>".to_string());
+                ::cu29::logcodec::set_effective_config_ron::<super::#mission_mod::CuStampedDataSet>(&effective_config_ron);
                 let stack_info = RuntimeLifecycleStackInfo {
                     app_name: env!("CARGO_PKG_NAME").to_string(),
                     app_version: env!("CARGO_PKG_VERSION").to_string(),
                     git_commit: #git_commit_tokens,
                     git_dirty: #git_dirty_tokens,
+                    subsystem_id: #application_name::subsystem().id().map(str::to_string),
+                    subsystem_code: #application_name::subsystem().code(),
+                    instance_id,
                 };
                 runtime_lifecycle_stream.log(&RuntimeLifecycleRecord {
                     timestamp: clock.now(),
@@ -2795,24 +4199,32 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
 
                 #[cfg(target_os = "none")]
                 ::cu29::prelude::info!("CuApp new: building runtime");
-                let copper_runtime = CuRuntime::<#mission_mod::#tasks_type, #mission_mod::CuBridges, #mission_mod::CuStampedDataSet, #monitor_type, #DEFAULT_CLNB>::new_with_resources(
+                let copper_runtime = CuRuntimeBuilder::<#mission_mod::#tasks_type, #mission_mod::CuBridges, #mission_mod::CuStampedDataSet, #monitor_type, #copperlist_count_tokens, _, _, _, _, _>::new(
                     clock,
                     &config,
                     #mission,
-                    resources,
-                    #mission_mod::#tasks_instanciator_fn,
-                    #mission_mod::MONITORED_COMPONENTS,
-                    #mission_mod::CULIST_COMPONENT_MAPPING,
-                    #mission_mod::monitor_instanciator,
-                    #mission_mod::bridges_instanciator,
+                    CuRuntimeParts::new(
+                        #mission_mod::#tasks_instanciator_fn,
+                        #mission_mod::MONITORED_COMPONENTS,
+                        #mission_mod::CULIST_COMPONENT_MAPPING,
+                        #parallel_rt_metadata_arg
+                        #mission_mod::monitor_instanciator,
+                        #mission_mod::bridges_instanciator,
+                    ),
                     copperlist_stream,
-                    keyframes_stream)?;
+                    keyframes_stream,
+                )
+                .with_subsystem(#application_name::subsystem())
+                .with_instance_id(instance_id)
+                .with_resources(resources)
+                .build()?;
                 #[cfg(target_os = "none")]
                 ::cu29::prelude::info!("CuApp new: runtime built");
 
                 let application = Ok(#application_name {
                     copper_runtime,
                     runtime_lifecycle_stream: Some(Box::new(runtime_lifecycle_stream)),
+                    logger_runtime,
                 });
 
                 #sim_callback_on_new
@@ -2823,6 +4235,14 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
 
         let app_inherent_impl = quote! {
             impl #application_name {
+                const SUBSYSTEM: cu29::prelude::app::Subsystem =
+                    cu29::prelude::app::Subsystem::new(#subsystem_id_tokens, #subsystem_code_literal);
+
+                #[inline]
+                pub fn subsystem() -> cu29::prelude::app::Subsystem {
+                    Self::SUBSYSTEM
+                }
+
                 pub fn original_config() -> String {
                     #copper_config_content.to_string()
                 }
@@ -2831,12 +4251,18 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                     #(#reflect_type_registration_calls)*
                 }
 
+                /// Returns a clone of the runtime clock handle.
+                #[inline]
+                pub fn clock(&self) -> cu29::clock::RobotClock {
+                    self.copper_runtime.clock()
+                }
+
                 /// Log one runtime lifecycle event with the current runtime timestamp.
                 pub fn log_runtime_lifecycle_event(
                     &mut self,
                     event: RuntimeLifecycleEvent,
                 ) -> CuResult<()> {
-                    let timestamp = self.copper_runtime.clock.now();
+                    let timestamp = self.copper_runtime.clock_ref().now();
                     let Some(stream) = self.runtime_lifecycle_stream.as_mut() else {
                         return Err(CuError::from("Runtime lifecycle stream is not initialized"));
                     };
@@ -2850,14 +4276,25 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                     self.log_runtime_lifecycle_event(RuntimeLifecycleEvent::ShutdownCompleted)
                 }
 
-                #init_resources_fn
-
-                #new_with_resources_fn
+                #prepare_config_fn
+                #prepare_resources_compat_fn
+                #prepare_resources_fn
+                #init_resources_compat_fn
+                #new_with_resources_compat_fn
+                #build_with_resources_fn
 
                 /// Mutable access to the underlying runtime (used by tools such as deterministic re-sim).
                 #[inline]
-                pub fn copper_runtime_mut(&mut self) -> &mut CuRuntime<#mission_mod::#tasks_type, #mission_mod::CuBridges, #mission_mod::CuStampedDataSet, #monitor_type, #DEFAULT_CLNB> {
+                pub fn copper_runtime_mut(&mut self) -> &mut CuRuntime<#mission_mod::#tasks_type, #mission_mod::CuBridges, #mission_mod::CuStampedDataSet, #monitor_type, #copperlist_count_tokens> {
                     &mut self.copper_runtime
+                }
+            }
+        };
+
+        let app_metadata_impl = quote! {
+            impl cu29::prelude::app::CuSubsystemMetadata for #application_name {
+                fn subsystem() -> cu29::prelude::app::Subsystem {
+                    #application_name::subsystem()
                 }
             }
         };
@@ -2887,6 +4324,25 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             }
         };
 
+        let app_runtime_copperlist_impl = quote! {
+            impl cu29::app::CurrentRuntimeCopperList<#mission_mod::CuStampedDataSet>
+                for #application_name
+            {
+                fn current_runtime_copperlist_bytes(&self) -> Option<&[u8]> {
+                    self.copper_runtime.copperlists_manager.last_completed_encoded()
+                }
+
+                fn set_current_runtime_copperlist_bytes(
+                    &mut self,
+                    snapshot: Option<Vec<u8>>,
+                ) {
+                    self.copper_runtime
+                        .copperlists_manager
+                        .set_last_completed_encoded(snapshot);
+                }
+            }
+        };
+
         #[cfg(feature = "std")]
         #[cfg(feature = "macro_debug")]
         eprintln!("[build result]");
@@ -2894,55 +4350,184 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             #app_impl_decl {
                 #simstep_type_decl
 
-                #new {
-                    let app_resources = #init_resources_call;
-                    #new_with_resources_call
-                }
-
                 fn get_original_config() -> String {
                     Self::original_config()
                 }
+
+                #mission_id_method
 
                 #run_methods
             }
         };
 
+        let recorded_replay_app_impl = if sim_mode {
+            Some(quote! {
+                impl<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>
+                    CuRecordedReplayApplication<S, L> for #application_name
+                {
+                    type RecordedDataSet = #mission_mod::CuStampedDataSet;
+
+                    fn replay_recorded_copperlist(
+                        &mut self,
+                        clock_mock: &RobotClockMock,
+                        copperlist: &CopperList<Self::RecordedDataSet>,
+                        keyframe: Option<&KeyFrame>,
+                    ) -> CuResult<()> {
+                        if let Some(keyframe) = keyframe {
+                            if keyframe.culistid != copperlist.id {
+                                return Err(CuError::from(format!(
+                                    "Recorded keyframe culistid {} does not match copperlist {}",
+                                    keyframe.culistid, copperlist.id
+                                )));
+                            }
+
+                            if !self.copper_runtime_mut().captures_keyframe(copperlist.id) {
+                                return Err(CuError::from(format!(
+                                    "CopperList {} is not configured to capture a keyframe in this runtime",
+                                    copperlist.id
+                                )));
+                            }
+
+                            self.copper_runtime_mut()
+                                .set_forced_keyframe_timestamp(keyframe.timestamp);
+                            self.copper_runtime_mut().lock_keyframe(keyframe);
+                            clock_mock.set_value(keyframe.timestamp.as_nanos());
+                        } else {
+                            let timestamp =
+                                cu29::simulation::recorded_copperlist_timestamp(copperlist)
+                                    .ok_or_else(|| {
+                                        CuError::from(format!(
+                                            "Recorded copperlist {} has no process_time.start timestamps",
+                                            copperlist.id
+                                        ))
+                                    })?;
+                            clock_mock.set_value(timestamp.as_nanos());
+                        }
+
+                        let mut sim_callback = |step: SimStep<'_>| -> SimOverride {
+                            #mission_mod::recorded_replay_step(step, copperlist)
+                        };
+                        <Self as CuSimApplication<S, L>>::run_one_iteration(self, &mut sim_callback)
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        let distributed_replay_app_impl = if sim_mode {
+            Some(quote! {
+                impl<S: SectionStorage + 'static, L: UnifiedLogWrite<S> + 'static>
+                    cu29::prelude::app::CuDistributedReplayApplication<S, L> for #application_name
+                {
+                    fn build_distributed_replay(
+                        clock: cu29::clock::RobotClock,
+                        unified_logger: std::sync::Arc<std::sync::Mutex<L>>,
+                        instance_id: u32,
+                        config_override: Option<cu29::config::CuConfig>,
+                    ) -> CuResult<Self> {
+                        let mut noop =
+                            |_step: SimStep<'_>| cu29::simulation::SimOverride::ExecuteByRuntime;
+                        let builder = Self::builder()
+                            .with_logger::<S, L>(unified_logger)
+                            .with_clock(clock)
+                            .with_instance_id(instance_id);
+                        let builder = if let Some(config_override) = config_override {
+                            builder.with_config(config_override)
+                        } else {
+                            builder
+                        };
+                        builder.with_sim_callback(&mut noop).build()
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        let builder_prepare_config_call = if std {
+            quote! { #application_name::prepare_config(self.instance_id, self.config_override)? }
+        } else {
+            quote! {{
+                let _ = self.config_override;
+                #application_name::prepare_config()?
+            }}
+        };
+
+        let builder_with_config_method = if std {
+            Some(quote! {
+                #[allow(dead_code)]
+                pub fn with_config(mut self, config_override: CuConfig) -> Self {
+                    self.config_override = Some(config_override);
+                    self
+                }
+            })
+        } else {
+            None
+        };
+
+        let builder_default_clock = if std {
+            quote! { Some(RobotClock::default()) }
+        } else {
+            quote! { None }
+        };
+
         let (
             builder_struct,
-            builder_new,
             builder_impl,
+            builder_ctor,
+            builder_log_path_generics,
             builder_sim_callback_method,
             builder_build_sim_callback_arg,
         ) = if sim_mode {
             (
                 quote! {
                     #[allow(dead_code)]
-                    pub struct #builder_name <'a, F> {
+                    pub struct #builder_name<'a, F, S, L, R>
+                    where
+                        S: SectionStorage + 'static,
+                        L: UnifiedLogWrite<S> + 'static,
+                        R: FnOnce(&CuConfig) -> CuResult<ResourceManager>,
+                        F: FnMut(SimStep) -> SimOverride,
+                    {
                         clock: Option<RobotClock>,
-                        unified_logger: Option<Arc<Mutex<UnifiedLoggerWrite>>>,
+                        unified_logger: Arc<Mutex<L>>,
+                        instance_id: u32,
                         config_override: Option<CuConfig>,
-                        sim_callback: Option<&'a mut F>
+                        resources_factory: R,
+                        sim_callback: Option<&'a mut F>,
+                        _storage: core::marker::PhantomData<S>,
                     }
+                },
+                quote! {
+                    impl<'a, F, S, L, R> #builder_name<'a, F, S, L, R>
+                    where
+                        S: SectionStorage + 'static,
+                        L: UnifiedLogWrite<S> + 'static,
+                        R: FnOnce(&CuConfig) -> CuResult<ResourceManager>,
+                        F: FnMut(SimStep) -> SimOverride,
                 },
                 quote! {
                     #[allow(dead_code)]
-                    pub fn new() -> Self {
-                        Self {
-                            clock: None,
-                            unified_logger: None,
+                    pub fn builder<'a, F>() -> #builder_name<'a, F, cu29::prelude::NoopSectionStorage, cu29::prelude::NoopLogger, fn(&CuConfig) -> CuResult<ResourceManager>>
+                    where
+                        F: FnMut(SimStep) -> SimOverride,
+                    {
+                        #builder_name {
+                            clock: #builder_default_clock,
+                            unified_logger: Arc::new(Mutex::new(cu29::prelude::NoopLogger::new())),
+                            instance_id: 0,
                             config_override: None,
+                            resources_factory: #mission_mod::resources_instanciator as fn(&CuConfig) -> CuResult<ResourceManager>,
                             sim_callback: None,
+                            _storage: core::marker::PhantomData,
                         }
                     }
                 },
-                quote! {
-                    impl<'a, F> #builder_name <'a, F>
-                    where
-                        F: FnMut(SimStep) -> SimOverride,
-                },
+                quote! {'a, F, MmapSectionStorage, UnifiedLoggerWrite, R},
                 Some(quote! {
-                    pub fn with_sim_callback(mut self, sim_callback: &'a mut F) -> Self
-                    {
+                    #[allow(dead_code)]
+                    pub fn with_sim_callback(mut self, sim_callback: &'a mut F) -> Self {
                         self.sim_callback = Some(sim_callback);
                         self
                     }
@@ -2956,28 +4541,111 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             (
                 quote! {
                     #[allow(dead_code)]
-                    pub struct #builder_name {
+                    pub struct #builder_name<S, L, R>
+                    where
+                        S: SectionStorage + 'static,
+                        L: UnifiedLogWrite<S> + 'static,
+                        R: FnOnce(&CuConfig) -> CuResult<ResourceManager>,
+                    {
                         clock: Option<RobotClock>,
-                        unified_logger: Option<Arc<Mutex<UnifiedLoggerWrite>>>,
+                        unified_logger: Arc<Mutex<L>>,
+                        instance_id: u32,
                         config_override: Option<CuConfig>,
+                        resources_factory: R,
+                        _storage: core::marker::PhantomData<S>,
                     }
+                },
+                quote! {
+                    impl<S, L, R> #builder_name<S, L, R>
+                    where
+                        S: SectionStorage + 'static,
+                        L: UnifiedLogWrite<S> + 'static,
+                        R: FnOnce(&CuConfig) -> CuResult<ResourceManager>,
                 },
                 quote! {
                     #[allow(dead_code)]
-                    pub fn new() -> Self {
-                        Self {
-                            clock: None,
-                            unified_logger: None,
+                    pub fn builder() -> #builder_name<cu29::prelude::NoopSectionStorage, cu29::prelude::NoopLogger, fn(&CuConfig) -> CuResult<ResourceManager>> {
+                        #builder_name {
+                            clock: #builder_default_clock,
+                            unified_logger: Arc::new(Mutex::new(cu29::prelude::NoopLogger::new())),
+                            instance_id: 0,
                             config_override: None,
+                            resources_factory: #mission_mod::resources_instanciator as fn(&CuConfig) -> CuResult<ResourceManager>,
+                            _storage: core::marker::PhantomData,
                         }
                     }
                 },
-                quote! {
-                    impl #builder_name
-                },
+                quote! {MmapSectionStorage, UnifiedLoggerWrite, R},
                 None,
                 None,
             )
+        };
+
+        let builder_with_logger_generics = if sim_mode {
+            quote! {'a, F, S2, L2, R}
+        } else {
+            quote! {S2, L2, R}
+        };
+
+        let builder_with_resources_generics = if sim_mode {
+            quote! {'a, F, S, L, R2}
+        } else {
+            quote! {S, L, R2}
+        };
+
+        let builder_sim_callback_field_copy = if sim_mode {
+            Some(quote! {
+                sim_callback: self.sim_callback,
+            })
+        } else {
+            None
+        };
+
+        let builder_with_log_path_method = if std {
+            Some(quote! {
+                #[allow(dead_code)]
+                pub fn with_log_path(
+                    self,
+                    path: impl AsRef<std::path::Path>,
+                    slab_size: Option<usize>,
+                ) -> CuResult<#builder_name<#builder_log_path_generics>> {
+                    let preallocated_size = slab_size.unwrap_or(1024 * 1024 * 10);
+                    let logger = cu29::prelude::UnifiedLoggerBuilder::new()
+                        .write(true)
+                        .create(true)
+                        .file_base_name(path.as_ref())
+                        .preallocated_size(preallocated_size)
+                        .build()
+                        .map_err(|e| CuError::new_with_cause("Failed to create unified logger", e))?;
+                    let logger = match logger {
+                        cu29::prelude::UnifiedLogger::Write(logger) => logger,
+                        cu29::prelude::UnifiedLogger::Read(_) => {
+                            return Err(CuError::from(
+                                "UnifiedLoggerBuilder did not create a write-capable logger",
+                            ));
+                        }
+                    };
+                    Ok(self.with_logger::<MmapSectionStorage, UnifiedLoggerWrite>(Arc::new(Mutex::new(
+                        logger,
+                    ))))
+                }
+            })
+        } else {
+            None
+        };
+
+        let builder_with_unified_logger_method = if std {
+            Some(quote! {
+                #[allow(dead_code)]
+                pub fn with_unified_logger(
+                    self,
+                    unified_logger: Arc<Mutex<UnifiedLoggerWrite>>,
+                ) -> #builder_name<#builder_log_path_generics> {
+                    self.with_logger::<MmapSectionStorage, UnifiedLoggerWrite>(unified_logger)
+                }
+            })
+        } else {
+            None
         };
 
         // backward compat on std non-parameterized impl.
@@ -2996,6 +4664,19 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                             }
                             pub fn stop_all_tasks(&mut self, sim_callback: &mut impl FnMut(SimStep) -> SimOverride) -> CuResult<()> {
                                 <Self as #app_trait<MmapSectionStorage, UnifiedLoggerWrite>>::stop_all_tasks(self, sim_callback)
+                            }
+                            pub fn replay_recorded_copperlist(
+                                &mut self,
+                                clock_mock: &RobotClockMock,
+                                copperlist: &CopperList<CuStampedDataSet>,
+                                keyframe: Option<&KeyFrame>,
+                            ) -> CuResult<()> {
+                                <Self as CuRecordedReplayApplication<MmapSectionStorage, UnifiedLoggerWrite>>::replay_recorded_copperlist(
+                                    self,
+                                    clock_mock,
+                                    copperlist,
+                                    keyframe,
+                                )
                             }
                         }
             })
@@ -3021,57 +4702,91 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
             None // if no-std, let the user figure our the correct logger type they need to provide anyway.
         };
 
-        let application_builder = if std {
-            Some(quote! {
-                #builder_struct
+        let application_builder = Some(quote! {
+            #builder_struct
 
-                #builder_impl
+            #builder_impl
+            {
+                #[allow(dead_code)]
+                pub fn with_clock(mut self, clock: RobotClock) -> Self {
+                    self.clock = Some(clock);
+                    self
+                }
+
+                #[allow(dead_code)]
+                pub fn with_logger<S2, L2>(
+                    self,
+                    unified_logger: Arc<Mutex<L2>>,
+                ) -> #builder_name<#builder_with_logger_generics>
+                where
+                    S2: SectionStorage + 'static,
+                    L2: UnifiedLogWrite<S2> + 'static,
                 {
-                    #builder_new
-
-                    #[allow(dead_code)]
-                    pub fn with_clock(mut self, clock: RobotClock) -> Self {
-                        self.clock = Some(clock);
-                        self
-                    }
-
-                    #[allow(dead_code)]
-                    pub fn with_unified_logger(mut self, unified_logger: Arc<Mutex<UnifiedLoggerWrite>>) -> Self {
-                        self.unified_logger = Some(unified_logger);
-                        self
-                    }
-
-                    #[allow(dead_code)]
-                    pub fn with_context(mut self, copper_ctx: &CopperContext) -> Self {
-                        self.clock = Some(copper_ctx.clock.clone());
-                        self.unified_logger = Some(copper_ctx.unified_logger.clone());
-                        self
-                    }
-
-                    #[allow(dead_code)]
-                    pub fn with_config(mut self, config_override: CuConfig) -> Self {
-                            self.config_override = Some(config_override);
-                            self
-                    }
-
-                    #builder_sim_callback_method
-
-                    #[allow(dead_code)]
-                    pub fn build(self) -> CuResult<#application_name> {
-                        #application_name::new(
-                            self.clock
-                                .ok_or(CuError::from("Clock missing from builder"))?,
-                            self.unified_logger
-                                .ok_or(CuError::from("Unified logger missing from builder"))?,
-                            self.config_override,
-                            #builder_build_sim_callback_arg
-                        )
+                    #builder_name {
+                        clock: self.clock,
+                        unified_logger,
+                        instance_id: self.instance_id,
+                        config_override: self.config_override,
+                        resources_factory: self.resources_factory,
+                        #builder_sim_callback_field_copy
+                        _storage: core::marker::PhantomData,
                     }
                 }
-            })
-        } else {
-            // in no-std the user has to construct that manually anyway so don't make any helper here.
-            None
+
+                #builder_with_unified_logger_method
+
+                #[allow(dead_code)]
+                pub fn with_instance_id(mut self, instance_id: u32) -> Self {
+                    self.instance_id = instance_id;
+                    self
+                }
+
+                pub fn with_resources<R2>(self, resources_factory: R2) -> #builder_name<#builder_with_resources_generics>
+                where
+                    R2: FnOnce(&CuConfig) -> CuResult<ResourceManager>,
+                {
+                    #builder_name {
+                        clock: self.clock,
+                        unified_logger: self.unified_logger,
+                        instance_id: self.instance_id,
+                        config_override: self.config_override,
+                        resources_factory,
+                        #builder_sim_callback_field_copy
+                        _storage: core::marker::PhantomData,
+                    }
+                }
+
+                #builder_with_config_method
+                #builder_with_log_path_method
+                #builder_sim_callback_method
+
+                #[allow(dead_code)]
+                pub fn build(self) -> CuResult<#application_name> {
+                    let clock = self
+                        .clock
+                        .ok_or(CuError::from("Clock missing from builder"))?;
+                    let (config, config_source) = #builder_prepare_config_call;
+                    let resources = (self.resources_factory)(&config)?;
+                    let app_resources = AppResources {
+                        config,
+                        config_source,
+                        resources,
+                    };
+                    #application_name::build_with_resources(
+                        clock,
+                        self.unified_logger,
+                        app_resources,
+                        self.instance_id,
+                        #builder_build_sim_callback_arg
+                    )
+                }
+            }
+        });
+
+        let app_builder_inherent_impl = quote! {
+            impl #application_name {
+                #builder_ctor
+            }
         };
 
         let sim_imports = if sim_mode {
@@ -3082,6 +4797,7 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 use cu29::simulation::CuSimSinkTask;
                 use cu29::simulation::CuSimBridge;
                 use cu29::prelude::app::CuSimApplication;
+                use cu29::prelude::app::CuRecordedReplayApplication;
                 use cu29::cubridge::BridgeChannelSet;
             })
         } else {
@@ -3161,8 +4877,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         let imports = if std {
             quote! {
                 use cu29::rayon::ThreadPool;
+                use cu29::cuasynctask::CuAsyncSrcTask;
                 use cu29::cuasynctask::CuAsyncTask;
-                use cu29::curuntime::CopperContext;
                 use cu29::resource::{ResourceBindings, ResourceManager};
                 use cu29::prelude::SectionStorage;
                 use cu29::prelude::UnifiedLoggerWrite;
@@ -3207,9 +4923,12 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 use cu29::bincode::de::DecoderImpl;
                 use cu29::bincode::error::DecodeError;
                 use cu29::clock::RobotClock;
+                use cu29::clock::RobotClockMock;
                 use cu29::config::CuConfig;
                 use cu29::config::ComponentConfig;
                 use cu29::curuntime::CuRuntime;
+                use cu29::curuntime::CuRuntimeBuilder;
+                use cu29::curuntime::CuRuntimeParts;
                 use cu29::curuntime::KeyFrame;
                 use cu29::curuntime::RuntimeLifecycleConfigSource;
                 use cu29::curuntime::RuntimeLifecycleEvent;
@@ -3251,9 +4970,11 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 #resources_instanciator_fn
                 #task_mapping_defs
                 #bridge_mapping_defs
+                #(#autogenerated_output_warnings)*
 
                 #sim_tasks
                 #sim_support
+                #recorded_replay_support
                 #sim_tasks_instanciator
 
                 pub const TASK_IDS: &'static [&'static str] = &[#( #task_ids ),*];
@@ -3266,6 +4987,7 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                         MONITORED_COMPONENTS,
                         CULIST_COMPONENT_MAPPING,
                     );
+                #parallel_rt_metadata_defs
 
                 #[inline]
                 pub fn monitor_component_label(
@@ -3275,6 +4997,8 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 }
 
                 #culist_support
+                #parallel_rt_support_tokens
+
                 #tasks_instanciator
                 #bridges_instanciator
 
@@ -3291,8 +5015,13 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
                 pub #application_struct
 
                 #app_inherent_impl
+                #app_builder_inherent_impl
+                #app_metadata_impl
                 #app_reflect_impl
+                #app_runtime_copperlist_impl
                 #application_impl
+                #recorded_replay_app_impl
+                #distributed_replay_app_impl
 
                 #std_application_impl
 
@@ -3303,15 +5032,13 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
         all_missions_tokens.push(mission_mod_tokens);
     }
 
-    let default_application_tokens = if all_missions.contains_key("default") {
-        let default_builder = if std {
-            Some(quote! {
-                // you can bypass the builder and not use it
-                #[allow(unused_imports)]
-                use default::#builder_name;
-            })
-        } else {
-            None
+    let default_application_tokens = if all_missions
+        .iter()
+        .any(|(mission_name, _)| mission_name == "default")
+    {
+        let default_builder = quote! {
+            #[allow(unused_imports)]
+            use default::#builder_name;
         };
         quote! {
             #default_builder
@@ -3337,14 +5064,150 @@ pub fn copper_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
     result.into()
 }
 
-fn read_config(config_file: &str) -> CuResult<CuConfig> {
-    let filename = config_full_path(config_file);
+fn resolve_runtime_config(args: &CopperRuntimeArgs) -> CuResult<ResolvedRuntimeConfig> {
+    let caller_root = utils::caller_crate_root();
+    resolve_runtime_config_with_root(args, &caller_root)
+}
 
-    read_configuration(filename.as_str())
+fn resolve_runtime_config_with_root(
+    args: &CopperRuntimeArgs,
+    caller_root: &Path,
+) -> CuResult<ResolvedRuntimeConfig> {
+    let filename = config_full_path_from_root(caller_root, &args.config_path);
+    if !Path::new(&filename).exists() {
+        return Err(CuError::from(format!(
+            "The configuration file `{}` does not exist. Please provide a valid path.",
+            args.config_path
+        )));
+    }
+
+    if let Some(subsystem_id) = args.subsystem_id.as_deref() {
+        let multi_config = cu29_runtime::config::read_multi_configuration(filename.as_str())
+            .map_err(|e| {
+                CuError::from(format!(
+                    "When `subsystem = \"{subsystem_id}\"` is provided, `config = \"{}\"` must point to a valid multi-Copper configuration: {e}",
+                    args.config_path
+                ))
+            })?;
+        let subsystem = multi_config.subsystem(subsystem_id).ok_or_else(|| {
+            CuError::from(format!(
+                "Subsystem '{subsystem_id}' was not found in multi-Copper configuration '{}'.",
+                args.config_path
+            ))
+        })?;
+        let bundled_local_config_content = read_to_string(&subsystem.config_path).map_err(|e| {
+            CuError::from(format!(
+                "Failed to read bundled local configuration for subsystem '{subsystem_id}' from '{}'.",
+                subsystem.config_path
+            ))
+            .add_cause(e.to_string().as_str())
+        })?;
+
+        Ok(ResolvedRuntimeConfig {
+            local_config: subsystem.config.clone(),
+            bundled_local_config_content,
+            subsystem_id: Some(subsystem_id.to_string()),
+            subsystem_code: subsystem.subsystem_code,
+        })
+    } else {
+        Ok(ResolvedRuntimeConfig {
+            local_config: read_configuration(filename.as_str())?,
+            bundled_local_config_content: read_to_string(&filename).map_err(|e| {
+                CuError::from(format!(
+                    "Could not read the configuration file '{}'.",
+                    args.config_path
+                ))
+                .add_cause(e.to_string().as_str())
+            })?,
+            subsystem_id: None,
+            subsystem_code: 0,
+        })
+    }
+}
+
+fn build_config_load_stmt(
+    std_enabled: bool,
+    application_name: &Ident,
+    subsystem_id: Option<&str>,
+) -> proc_macro2::TokenStream {
+    if std_enabled {
+        if let Some(subsystem_id) = subsystem_id {
+            quote! {
+                let (config, config_source) = if let Some(overridden_config) = config_override {
+                    debug!("CuConfig: Overridden programmatically.");
+                    (overridden_config, RuntimeLifecycleConfigSource::ProgrammaticOverride)
+                } else if ::std::path::Path::new(config_filename).exists() {
+                    let subsystem_id = #application_name::subsystem()
+                        .id()
+                        .expect("generated multi-Copper runtime is missing a subsystem id");
+                    debug!(
+                        "CuConfig: Reading multi-Copper configuration from file: {} (subsystem={})",
+                        config_filename,
+                        subsystem_id
+                    );
+                    let multi_config = cu29::config::read_multi_configuration(config_filename)?;
+                    (
+                        multi_config.resolve_subsystem_config_for_instance(subsystem_id, instance_id)?,
+                        RuntimeLifecycleConfigSource::ExternalFile,
+                    )
+                } else {
+                    let original_config = Self::original_config();
+                    debug!(
+                        "CuConfig: Using the bundled subsystem configuration compiled into the binary (subsystem={}).",
+                        #subsystem_id
+                    );
+                    if instance_id != 0 {
+                        debug!(
+                            "CuConfig: runtime file '{}' is missing, so instance-specific overrides for instance_id={} cannot be resolved; using bundled subsystem defaults.",
+                            config_filename,
+                            instance_id
+                        );
+                    }
+                    (
+                        cu29::config::read_configuration_str(original_config, None)?,
+                        RuntimeLifecycleConfigSource::BundledDefault,
+                    )
+                };
+            }
+        } else {
+            quote! {
+                let _ = instance_id;
+                let (config, config_source) = if let Some(overridden_config) = config_override {
+                    debug!("CuConfig: Overridden programmatically.");
+                    (overridden_config, RuntimeLifecycleConfigSource::ProgrammaticOverride)
+                } else if ::std::path::Path::new(config_filename).exists() {
+                    debug!("CuConfig: Reading configuration from file: {}", config_filename);
+                    (
+                        cu29::config::read_configuration(config_filename)?,
+                        RuntimeLifecycleConfigSource::ExternalFile,
+                    )
+                } else {
+                    let original_config = Self::original_config();
+                    debug!("CuConfig: Using the bundled configuration compiled into the binary.");
+                    (
+                        cu29::config::read_configuration_str(original_config, None)?,
+                        RuntimeLifecycleConfigSource::BundledDefault,
+                    )
+                };
+            }
+        }
+    } else {
+        quote! {
+            // Only the original config is available in no-std
+            let original_config = Self::original_config();
+            debug!("CuConfig: Using the bundled configuration compiled into the binary.");
+            let config = cu29::config::read_configuration_str(original_config, None)?;
+            let config_source = RuntimeLifecycleConfigSource::BundledDefault;
+        }
+    }
 }
 
 fn config_full_path(config_file: &str) -> String {
-    let mut config_full_path = utils::caller_crate_root();
+    config_full_path_from_root(&utils::caller_crate_root(), config_file)
+}
+
+fn config_full_path_from_root(caller_root: &Path, config_file: &str) -> String {
+    let mut config_full_path = caller_root.to_path_buf();
     config_full_path.push(config_file);
     let filename = config_full_path
         .as_os_str()
@@ -3353,18 +5216,48 @@ fn config_full_path(config_file: &str) -> String {
     filename.to_string()
 }
 
-fn extract_tasks_output_types(graph: &CuGraph) -> Vec<Option<Type>> {
-    graph
-        .get_all_nodes()
-        .iter()
-        .map(|(_, node)| {
-            let id = node.get_id();
-            let type_str = graph.get_node_output_msg_type(id.as_str());
-            type_str.map(|type_str| {
-                parse_str::<Type>(type_str.as_str()).expect("Could not parse output message type.")
-            })
-        })
-        .collect()
+fn read_config(config_file: &str) -> CuResult<CuConfig> {
+    let filename = config_full_path(config_file);
+    read_configuration(filename.as_str())
+}
+
+fn inferred_single_output_payload_type(task_type: &Type, task_kind: CuTaskType) -> Type {
+    match task_kind {
+        CuTaskType::Source => parse_quote! {
+            <<#task_type as cu29::cutask::CuSrcTask>::Output<'static> as cu29::cutask::CuSingleOutputMsg>::Payload
+        },
+        CuTaskType::Regular => parse_quote! {
+            <<#task_type as cu29::cutask::CuTask>::Output<'static> as cu29::cutask::CuSingleOutputMsg>::Payload
+        },
+        CuTaskType::Sink => panic!("Sinks do not have output payload types"),
+    }
+}
+
+fn task_output_payload_type(
+    graph: &CuGraph,
+    node: &Node,
+    task_kind: CuTaskType,
+    task_type: &Type,
+) -> Option<Type> {
+    if task_kind == CuTaskType::Sink {
+        return None;
+    }
+
+    let id = node.get_id();
+    if let Some(type_str) = graph.get_node_output_msg_type(id.as_str()) {
+        return Some(
+            parse_str::<Type>(type_str.as_str()).expect("Could not parse output message type."),
+        );
+    }
+
+    node.get_declared_task_kind()
+        .map(|_| inferred_single_output_payload_type(task_type, task_kind))
+}
+
+fn synthesized_single_output_msg_name(task_type: &Type, task_kind: CuTaskType) -> String {
+    inferred_single_output_payload_type(task_type, task_kind)
+        .to_token_stream()
+        .to_string()
 }
 
 struct CuTaskSpecSet {
@@ -3379,11 +5272,12 @@ struct CuTaskSpecSet {
     pub run_in_sim_flags: Vec<bool>,
     #[allow(dead_code)]
     pub output_types: Vec<Option<Type>>,
+    pub autogenerated_output_flags: Vec<bool>,
     pub node_id_to_task_index: Vec<Option<usize>>,
 }
 
 impl CuTaskSpecSet {
-    pub fn from_graph(graph: &CuGraph) -> Self {
+    pub fn from_graph(graph: &CuGraph) -> CuResult<Self> {
         let all_id_nodes: Vec<(NodeId, &Node)> = graph
             .get_all_nodes()
             .into_iter()
@@ -3395,10 +5289,10 @@ impl CuTaskSpecSet {
             .map(|(_, node)| node.get_id().to_string())
             .collect();
 
-        let cutypes = all_id_nodes
+        let cutypes: Vec<CuTaskType> = all_id_nodes
             .iter()
             .map(|(id, _)| find_task_type_for_id(graph, *id))
-            .collect();
+            .collect::<CuResult<Vec<_>>>()?;
 
         let background_flags: Vec<bool> = all_id_nodes
             .iter()
@@ -3415,57 +5309,102 @@ impl CuTaskSpecSet {
             .map(|(_, node)| node.get_type().to_string())
             .collect();
 
-        let output_types = extract_tasks_output_types(graph);
-
-        let task_types = type_names
-            .iter()
-            .zip(background_flags.iter())
-            .zip(output_types.iter())
-            .map(|((name, &background), output_type)| {
-                let name_type = parse_str::<Type>(name).unwrap_or_else(|error| {
-                    panic!("Could not transform {name} into a Task Rust type: {error}");
-                });
-                if background {
-                    if let Some(output_type) = output_type {
-                        parse_quote!(CuAsyncTask<#name_type, #output_type>)
-                    } else {
-                        panic!("{name}: If a task is background, it has to have an output");
-                    }
-                } else {
-                    name_type
-                }
-            })
-            .collect();
-
-        let instantiation_types = type_names
-            .iter()
-            .zip(background_flags.iter())
-            .zip(output_types.iter())
-            .map(|((name, &background), output_type)| {
-                let name_type = parse_str::<Type>(name).unwrap_or_else(|error| {
-                    panic!("Could not transform {name} into a Task Rust type: {error}");
-                });
-                if background {
-                    if let Some(output_type) = output_type {
-                        parse_quote!(CuAsyncTask::<#name_type, #output_type>)
-                    } else {
-                        panic!("{name}: If a task is background, it has to have an output");
-                    }
-                } else {
-                    name_type
-                }
-            })
-            .collect();
-
-        let sim_task_types = type_names
+        let parsed_task_types: Vec<Type> = type_names
             .iter()
             .map(|name| {
-                parse_str::<Type>(name).unwrap_or_else(|err| {
-                    eprintln!("Could not transform {name} into a Task Rust type.");
-                    panic!("{err}")
+                parse_str::<Type>(name).unwrap_or_else(|error| {
+                    panic!("Could not transform {name} into a Task Rust type: {error}");
                 })
             })
             .collect();
+
+        let output_types: Vec<Option<Type>> = all_id_nodes
+            .iter()
+            .zip(cutypes.iter())
+            .zip(parsed_task_types.iter())
+            .map(|(((_, node), &task_kind), task_type)| {
+                task_output_payload_type(graph, node, task_kind, task_type)
+            })
+            .collect();
+
+        let autogenerated_output_flags: Vec<bool> = all_id_nodes
+            .iter()
+            .zip(cutypes.iter())
+            .map(|((node_id, node), &task_kind)| {
+                task_kind != CuTaskType::Sink
+                    && node.get_declared_task_kind().is_some()
+                    && graph
+                        .get_node_output_msg_types_by_id(*node_id)
+                        .expect("missing output type lookup")
+                        .is_empty()
+            })
+            .collect();
+
+        let task_types = parsed_task_types
+            .iter()
+            .zip(type_names.iter())
+            .zip(cutypes.iter())
+            .zip(background_flags.iter())
+            .zip(output_types.iter())
+            .map(|((((name_type, name), cutype), &background), output_type)| {
+                if background {
+                    if let Some(output_type) = output_type {
+                        match cutype {
+                            CuTaskType::Source => {
+                                parse_quote!(CuAsyncSrcTask<#name_type, #output_type>)
+                            }
+                            CuTaskType::Regular => {
+                                parse_quote!(CuAsyncTask<#name_type, #output_type>)
+                            }
+                            CuTaskType::Sink => {
+                                panic!("CuSinkTask {name} cannot be a background task, it should be a regular task.");
+                            }
+                        }
+                    } else {
+                        panic!(
+                            "{}: If a task is background, it has to have an output",
+                            name_type.to_token_stream()
+                        );
+                    }
+                } else {
+                    name_type.clone()
+                }
+            })
+            .collect();
+
+        let instantiation_types = parsed_task_types
+            .iter()
+            .zip(type_names.iter())
+            .zip(cutypes.iter())
+            .zip(background_flags.iter())
+            .zip(output_types.iter())
+            .map(|((((name_type, name), cutype), &background), output_type)| {
+                if background {
+                    if let Some(output_type) = output_type {
+                        match cutype {
+                            CuTaskType::Source => {
+                                parse_quote!(CuAsyncSrcTask::<#name_type, #output_type>)
+                            }
+                            CuTaskType::Regular => {
+                                parse_quote!(CuAsyncTask::<#name_type, #output_type>)
+                            }
+                            CuTaskType::Sink => {
+                                panic!("CuSinkTask {name} cannot be a background task, it should be a regular task.");
+                            }
+                        }
+                    } else {
+                        panic!(
+                            "{}: If a task is background, it has to have an output",
+                            name_type.to_token_stream()
+                        );
+                    }
+                } else {
+                    name_type.clone()
+                }
+            })
+            .collect();
+
+        let sim_task_types = parsed_task_types;
 
         let run_in_sim_flags = all_id_nodes
             .iter()
@@ -3477,7 +5416,7 @@ impl CuTaskSpecSet {
             node_id_to_task_index[*node_id as usize] = Some(index);
         }
 
-        Self {
+        Ok(Self {
             ids,
             cutypes,
             background_flags,
@@ -3488,14 +5427,16 @@ impl CuTaskSpecSet {
             sim_task_types,
             run_in_sim_flags,
             output_types,
+            autogenerated_output_flags,
             node_id_to_task_index,
-        }
+        })
     }
 }
 
 #[derive(Clone)]
 struct OutputPack {
     msg_types: Vec<Type>,
+    msg_type_names: Vec<String>,
 }
 
 impl OutputPack {
@@ -3521,7 +5462,7 @@ fn build_output_slot_type(msg_types: &[Type]) -> Type {
 
 fn flatten_slot_origin_ids(
     output_packs: &[OutputPack],
-    slot_origin_ids: Vec<Option<String>>,
+    slot_origin_ids: &[Option<String>],
 ) -> Vec<String> {
     let mut ids = Vec::new();
     for (slot, pack) in output_packs.iter().enumerate() {
@@ -3539,28 +5480,51 @@ fn flatten_slot_origin_ids(
     ids
 }
 
+fn flatten_task_output_specs(
+    output_packs: &[OutputPack],
+    slot_origin_ids: &[Option<String>],
+) -> Vec<(String, String, Type)> {
+    let mut specs = Vec::new();
+    for (slot, pack) in output_packs.iter().enumerate() {
+        if pack.msg_types.is_empty() {
+            continue;
+        }
+        let origin = slot_origin_ids
+            .get(slot)
+            .and_then(|origin| origin.as_ref())
+            .unwrap_or_else(|| panic!("Missing slot origin id for copperlist output slot {slot}"));
+        for (msg_type, payload_type) in pack.msg_type_names.iter().zip(pack.msg_types.iter()) {
+            specs.push((origin.clone(), msg_type.clone(), payload_type.clone()));
+        }
+    }
+    specs
+}
+
 fn extract_output_packs(runtime_plan: &CuExecutionLoop) -> Vec<OutputPack> {
     let mut packs: Vec<(u32, OutputPack)> = runtime_plan
         .steps
         .iter()
         .filter_map(|unit| match unit {
             CuExecutionUnit::Step(step) => {
-                if let Some(output_pack) = &step.output_msg_pack {
-                    let msg_types: Vec<Type> = output_pack
-                        .msg_types
-                        .iter()
-                        .map(|output_msg_type| {
-                            parse_str::<Type>(output_msg_type.as_str()).unwrap_or_else(|_| {
-                                panic!(
-                                    "Could not transform {output_msg_type} into a message Rust type."
-                                )
-                            })
+                let output_pack = step.output_msg_pack.as_ref()?;
+                let msg_types: Vec<Type> = output_pack
+                    .msg_types
+                    .iter()
+                    .map(|output_msg_type| {
+                        parse_str::<Type>(output_msg_type.as_str()).unwrap_or_else(|_| {
+                            panic!(
+                                "Could not transform {output_msg_type} into a message Rust type."
+                            )
                         })
-                        .collect();
-                    Some((output_pack.culist_index, OutputPack { msg_types }))
-                } else {
-                    None
-                }
+                    })
+                    .collect();
+                Some((
+                    output_pack.culist_index,
+                    OutputPack {
+                        msg_types,
+                        msg_type_names: output_pack.msg_types.clone(),
+                    },
+                ))
             }
             CuExecutionUnit::Loop(_) => todo!("Needs to be implemented"),
         })
@@ -3568,6 +5532,162 @@ fn extract_output_packs(runtime_plan: &CuExecutionLoop) -> Vec<OutputPack> {
 
     packs.sort_by_key(|(index, _)| *index);
     packs.into_iter().map(|(_, pack)| pack).collect()
+}
+
+#[derive(Clone)]
+struct SlotCodecBinding {
+    payload_type: Type,
+    task_id: String,
+    msg_type: String,
+    codec_type: syn::Path,
+    codec_type_path: String,
+}
+
+fn build_flat_slot_codec_bindings(
+    cuconfig: &CuConfig,
+    mission_label: Option<&str>,
+    output_packs: &[OutputPack],
+    node_output_positions: &HashMap<NodeId, usize>,
+    task_names: &[(NodeId, String, String)],
+) -> CuResult<Vec<Option<SlotCodecBinding>>> {
+    let mut slot_task_ids: Vec<Option<String>> = vec![None; output_packs.len()];
+    for (node_id, task_id, _) in task_names {
+        let Some(output_position) = node_output_positions.get(node_id) else {
+            continue;
+        };
+        slot_task_ids[*output_position] = Some(task_id.clone());
+    }
+
+    let mut bindings =
+        Vec::with_capacity(output_packs.iter().map(|pack| pack.msg_types.len()).sum());
+    for (slot_idx, pack) in output_packs.iter().enumerate() {
+        let task_id = slot_task_ids.get(slot_idx).and_then(|id| id.as_ref());
+        for (port_idx, payload_type) in pack.msg_types.iter().enumerate() {
+            let Some(task_id) = task_id else {
+                bindings.push(None);
+                continue;
+            };
+            let Some(msg_type) = pack.msg_type_names.get(port_idx) else {
+                return Err(CuError::from(format!(
+                    "Missing message type name for task '{task_id}' slot {slot_idx} port {port_idx}."
+                )));
+            };
+
+            let spec = cuconfig
+                .find_task_node(mission_label, task_id)
+                .and_then(|node| node.get_logging())
+                .and_then(|logging| logging.codec_for_msg_type(msg_type))
+                .map(|codec_id| {
+                    cuconfig.find_logging_codec_spec(codec_id).ok_or_else(|| {
+                        CuError::from(format!(
+                            "Task '{task_id}' binds output '{msg_type}' to unknown logging codec '{codec_id}'."
+                        ))
+                    })
+                })
+                .transpose()?;
+
+            if let Some(spec) = spec {
+                let codec_type = parse_str::<syn::Path>(&spec.type_).map_err(|_| {
+                    CuError::from(format!(
+                        "Logging codec '{}' for task '{task_id}' output '{msg_type}' is not a valid Rust type path.",
+                        spec.type_
+                    ))
+                })?;
+                bindings.push(Some(SlotCodecBinding {
+                    payload_type: payload_type.clone(),
+                    task_id: task_id.clone(),
+                    msg_type: msg_type.clone(),
+                    codec_type,
+                    codec_type_path: spec.type_.clone(),
+                }));
+            } else {
+                bindings.push(None);
+            }
+        }
+    }
+
+    Ok(bindings)
+}
+
+fn build_culist_codec_helpers(
+    flat_codec_bindings: &[Option<SlotCodecBinding>],
+    default_config_ron_ident: &Ident,
+    mission_label: Option<&str>,
+) -> (
+    Vec<proc_macro2::TokenStream>,
+    Vec<Option<Ident>>,
+    Vec<Option<Ident>>,
+) {
+    let mission_tokens = if let Some(mission) = mission_label {
+        let lit = LitStr::new(mission, Span::call_site());
+        quote! { Some(#lit) }
+    } else {
+        quote! { None }
+    };
+
+    let mut helpers = Vec::new();
+    let mut encode_helper_names = Vec::with_capacity(flat_codec_bindings.len());
+    let mut decode_helper_names = Vec::with_capacity(flat_codec_bindings.len());
+
+    for (flat_idx, binding) in flat_codec_bindings.iter().enumerate() {
+        let Some(binding) = binding else {
+            encode_helper_names.push(None);
+            decode_helper_names.push(None);
+            continue;
+        };
+
+        let encode_fn = format_ident!("__cu_logcodec_encode_slot_{flat_idx}");
+        let decode_fn = format_ident!("__cu_logcodec_decode_slot_{flat_idx}");
+        let payload_type = &binding.payload_type;
+        let codec_type = &binding.codec_type;
+        let task_id = LitStr::new(&binding.task_id, Span::call_site());
+        let msg_type = LitStr::new(&binding.msg_type, Span::call_site());
+        let codec_type_path = LitStr::new(&binding.codec_type_path, Span::call_site());
+
+        helpers.push(quote! {
+            fn #encode_fn<E: Encoder>(msg: &CuMsg<#payload_type>, encoder: &mut E) -> Result<(), EncodeError> {
+                static STATE: ::cu29::logcodec::CodecState<#codec_type> = ::cu29::logcodec::CodecState::new();
+                let config_entry = ::cu29::logcodec::effective_config_entry::<CuStampedDataSet>(#default_config_ron_ident);
+                ::cu29::logcodec::with_codec_for_encode(
+                    &STATE,
+                    config_entry,
+                    |effective_config_ron| {
+                        ::cu29::logcodec::instantiate_codec::<#codec_type, #payload_type>(
+                            effective_config_ron,
+                            #mission_tokens,
+                            #task_id,
+                            #msg_type,
+                            #codec_type_path,
+                        )
+                    },
+                    |codec| ::cu29::logcodec::encode_msg_with_codec(msg, codec, encoder),
+                )
+            }
+
+            fn #decode_fn<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<CuMsg<#payload_type>, DecodeError> {
+                static STATE: ::cu29::logcodec::CodecState<#codec_type> = ::cu29::logcodec::CodecState::new();
+                let config_entry = ::cu29::logcodec::effective_config_entry::<CuStampedDataSet>(#default_config_ron_ident);
+                ::cu29::logcodec::with_codec_for_decode(
+                    &STATE,
+                    config_entry,
+                    |effective_config_ron| {
+                        ::cu29::logcodec::instantiate_codec::<#codec_type, #payload_type>(
+                            effective_config_ron,
+                            #mission_tokens,
+                            #task_id,
+                            #msg_type,
+                            #codec_type_path,
+                        )
+                    },
+                    |codec| ::cu29::logcodec::decode_msg_with_codec(decoder, codec),
+                )
+            }
+        });
+        encode_helper_names.push(Some(encode_fn));
+        decode_helper_names.push(Some(decode_fn));
+    }
+
+    (helpers, encode_helper_names, decode_helper_names)
 }
 
 fn collect_output_pack_sizes(runtime_plan: &CuExecutionLoop) -> Vec<usize> {
@@ -3587,31 +5707,560 @@ fn collect_output_pack_sizes(runtime_plan: &CuExecutionLoop) -> Vec<usize> {
     sizes.into_iter().map(|(_, size)| size).collect()
 }
 
+fn sorted_mission_graphs(copper_config: &CuConfig) -> Vec<(String, CuGraph)> {
+    let mut all_missions: Vec<_> = copper_config
+        .graphs
+        .get_all_missions_graphs()
+        .into_iter()
+        .collect();
+    all_missions.sort_by(|(left, _), (right, _)| left.cmp(right));
+    all_missions
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalTaskInputSlot {
+    msg_type: String,
+    connection_orders: BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissionTaskInput {
+    msg_type: String,
+    connection_order: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TaskInputLayout {
+    slots: Vec<CanonicalTaskInputSlot>,
+    mission_slot_mappings: HashMap<String, Vec<Option<usize>>>,
+}
+
+#[derive(Clone, Copy)]
+enum AlignmentStep {
+    Match {
+        canonical_slot_index: usize,
+        mission_input_index: usize,
+    },
+    ExistingGap {
+        canonical_slot_index: usize,
+    },
+    Insert {
+        mission_input_index: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum AlignmentTransition {
+    Match,
+    ExistingGap,
+    Insert,
+}
+
+#[derive(Clone, Copy)]
+struct AlignmentBackpointer {
+    prev_i: usize,
+    prev_j: usize,
+    transition: AlignmentTransition,
+}
+
+#[derive(Clone, Copy)]
+struct AlignmentCell {
+    score: i32,
+    paths: u8,
+    backpointer: Option<AlignmentBackpointer>,
+}
+
+impl AlignmentCell {
+    fn unreachable() -> Self {
+        Self {
+            score: i32::MIN,
+            paths: 0,
+            backpointer: None,
+        }
+    }
+}
+
+fn collect_mission_task_inputs(
+    graph: &CuGraph,
+    node_id: NodeId,
+    task_id: &str,
+) -> CuResult<Vec<MissionTaskInput>> {
+    let mut edge_ids = graph.get_dst_edges(node_id)?;
+    edge_ids.sort_by_key(|edge_id| {
+        graph
+            .edge(*edge_id)
+            .map(|edge| edge.order)
+            .unwrap_or(usize::MAX)
+    });
+
+    edge_ids
+        .into_iter()
+        .map(|edge_id| {
+            let edge = graph.edge(edge_id).ok_or_else(|| {
+                CuError::from(format!(
+                    "Missing edge {edge_id} while collecting inputs for task '{task_id}'"
+                ))
+            })?;
+            Ok(MissionTaskInput {
+                msg_type: edge.msg.clone(),
+                connection_order: edge.order,
+            })
+        })
+        .collect()
+}
+
+fn format_canonical_input_slots(slots: &[CanonicalTaskInputSlot]) -> String {
+    let parts: Vec<String> = slots
+        .iter()
+        .map(|slot| {
+            let orders = slot
+                .connection_orders
+                .iter()
+                .map(|order| order.to_string())
+                .collect::<Vec<_>>()
+                .join("|");
+            format!("{}@{}", slot.msg_type, orders)
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+fn format_mission_task_inputs(inputs: &[MissionTaskInput]) -> String {
+    let parts: Vec<String> = inputs
+        .iter()
+        .map(|input| format!("{}@{}", input.msg_type, input.connection_order))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+const INPUT_MATCH_SCORE: i32 = 100;
+const ANCHORED_INPUT_MATCH_BONUS: i32 = 1;
+
+fn task_input_match_score(slot: &CanonicalTaskInputSlot, input: &MissionTaskInput) -> Option<i32> {
+    if slot.msg_type != input.msg_type {
+        return None;
+    }
+
+    let anchored_bonus = if slot.connection_orders.contains(&input.connection_order) {
+        ANCHORED_INPUT_MATCH_BONUS
+    } else {
+        0
+    };
+
+    Some(INPUT_MATCH_SCORE + anchored_bonus)
+}
+
+fn update_alignment_cell(
+    cell: &mut AlignmentCell,
+    candidate_score: i32,
+    candidate_paths: u8,
+    backpointer: Option<AlignmentBackpointer>,
+) {
+    if candidate_paths == 0 {
+        return;
+    }
+
+    if candidate_score > cell.score {
+        cell.score = candidate_score;
+        cell.paths = candidate_paths.min(2);
+        cell.backpointer = if candidate_paths == 1 {
+            backpointer
+        } else {
+            None
+        };
+    } else if candidate_score == cell.score {
+        cell.paths = cell.paths.saturating_add(candidate_paths).min(2);
+        cell.backpointer = None;
+    }
+}
+
+fn align_task_inputs(
+    task_id: &str,
+    mission_name: &str,
+    canonical_slots: &[CanonicalTaskInputSlot],
+    mission_inputs: &[MissionTaskInput],
+) -> CuResult<Vec<AlignmentStep>> {
+    let canonical_len = canonical_slots.len();
+    let mission_len = mission_inputs.len();
+    let mut table = vec![vec![AlignmentCell::unreachable(); mission_len + 1]; canonical_len + 1];
+    table[0][0] = AlignmentCell {
+        score: 0,
+        paths: 1,
+        backpointer: None,
+    };
+
+    for i in 0..=canonical_len {
+        for j in 0..=mission_len {
+            let cell = table[i][j];
+            if cell.paths == 0 {
+                continue;
+            }
+
+            if i < canonical_len {
+                update_alignment_cell(
+                    &mut table[i + 1][j],
+                    cell.score,
+                    cell.paths,
+                    if cell.paths == 1 {
+                        Some(AlignmentBackpointer {
+                            prev_i: i,
+                            prev_j: j,
+                            transition: AlignmentTransition::ExistingGap,
+                        })
+                    } else {
+                        None
+                    },
+                );
+            }
+
+            if j < mission_len {
+                update_alignment_cell(
+                    &mut table[i][j + 1],
+                    cell.score,
+                    cell.paths,
+                    if cell.paths == 1 {
+                        Some(AlignmentBackpointer {
+                            prev_i: i,
+                            prev_j: j,
+                            transition: AlignmentTransition::Insert,
+                        })
+                    } else {
+                        None
+                    },
+                );
+            }
+
+            if i < canonical_len
+                && j < mission_len
+                && let Some(match_score) =
+                    task_input_match_score(&canonical_slots[i], &mission_inputs[j])
+            {
+                update_alignment_cell(
+                    &mut table[i + 1][j + 1],
+                    cell.score + match_score,
+                    cell.paths,
+                    if cell.paths == 1 {
+                        Some(AlignmentBackpointer {
+                            prev_i: i,
+                            prev_j: j,
+                            transition: AlignmentTransition::Match,
+                        })
+                    } else {
+                        None
+                    },
+                );
+            }
+        }
+    }
+
+    let final_cell = table[canonical_len][mission_len];
+    if final_cell.paths > 1 {
+        return Err(CuError::from(format!(
+            "Task '{task_id}' has ambiguous input alignment while merging mission '{mission_name}'. Existing canonical inputs {} and mission inputs {} admit multiple equally valid alignments.",
+            format_canonical_input_slots(canonical_slots),
+            format_mission_task_inputs(mission_inputs),
+        )));
+    }
+
+    let mut steps = Vec::new();
+    let (mut i, mut j) = (canonical_len, mission_len);
+    while i > 0 || j > 0 {
+        let backpointer = table[i][j].backpointer.unwrap_or_else(|| {
+            panic!(
+                "Missing backpointer while aligning task '{task_id}' for mission '{mission_name}'"
+            )
+        });
+
+        match backpointer.transition {
+            AlignmentTransition::Match => steps.push(AlignmentStep::Match {
+                canonical_slot_index: i - 1,
+                mission_input_index: j - 1,
+            }),
+            AlignmentTransition::ExistingGap => steps.push(AlignmentStep::ExistingGap {
+                canonical_slot_index: i - 1,
+            }),
+            AlignmentTransition::Insert => steps.push(AlignmentStep::Insert {
+                mission_input_index: j - 1,
+            }),
+        }
+
+        i = backpointer.prev_i;
+        j = backpointer.prev_j;
+    }
+    steps.reverse();
+    Ok(steps)
+}
+
+fn merge_task_input_layout(
+    task_id: &str,
+    layout: &mut TaskInputLayout,
+    mission_name: String,
+    mission_inputs: Vec<MissionTaskInput>,
+) -> CuResult<()> {
+    let alignment = align_task_inputs(task_id, &mission_name, &layout.slots, &mission_inputs)?;
+    let mut new_slots = Vec::with_capacity(alignment.len());
+    let mut old_to_new = vec![None; layout.slots.len()];
+    let mut mission_mapping = Vec::with_capacity(alignment.len());
+
+    for step in alignment {
+        match step {
+            AlignmentStep::Match {
+                canonical_slot_index,
+                mission_input_index,
+            } => {
+                let mut slot = layout.slots[canonical_slot_index].clone();
+                slot.connection_orders
+                    .insert(mission_inputs[mission_input_index].connection_order);
+                let new_index = new_slots.len();
+                old_to_new[canonical_slot_index] = Some(new_index);
+                new_slots.push(slot);
+                mission_mapping.push(Some(mission_input_index));
+            }
+            AlignmentStep::ExistingGap {
+                canonical_slot_index,
+            } => {
+                let new_index = new_slots.len();
+                old_to_new[canonical_slot_index] = Some(new_index);
+                new_slots.push(layout.slots[canonical_slot_index].clone());
+                mission_mapping.push(None);
+            }
+            AlignmentStep::Insert {
+                mission_input_index,
+            } => {
+                new_slots.push(CanonicalTaskInputSlot {
+                    msg_type: mission_inputs[mission_input_index].msg_type.clone(),
+                    connection_orders: BTreeSet::from([
+                        mission_inputs[mission_input_index].connection_order
+                    ]),
+                });
+                mission_mapping.push(Some(mission_input_index));
+            }
+        }
+    }
+
+    let mut remapped_mission_slot_mappings =
+        HashMap::with_capacity(layout.mission_slot_mappings.len() + 1);
+    for (existing_mission, existing_mapping) in &layout.mission_slot_mappings {
+        let mut remapped = vec![None; new_slots.len()];
+        for (old_slot_index, maybe_local_input_index) in existing_mapping.iter().enumerate() {
+            let new_slot_index = old_to_new[old_slot_index].unwrap_or_else(|| {
+                panic!("Missing remap for task '{task_id}' canonical slot {old_slot_index}")
+            });
+            remapped[new_slot_index] = *maybe_local_input_index;
+        }
+        remapped_mission_slot_mappings.insert(existing_mission.clone(), remapped);
+    }
+    remapped_mission_slot_mappings.insert(mission_name, mission_mapping);
+
+    layout.slots = new_slots;
+    layout.mission_slot_mappings = remapped_mission_slot_mappings;
+    Ok(())
+}
+
+fn collect_task_input_layouts(
+    all_missions: &[(String, CuGraph)],
+) -> CuResult<HashMap<String, TaskInputLayout>> {
+    let mut task_mission_inputs: BTreeMap<String, Vec<(String, Vec<MissionTaskInput>)>> =
+        BTreeMap::new();
+
+    for (mission_name, graph) in all_missions {
+        for (node_id, node) in graph.get_all_nodes() {
+            if node.get_flavor() != Flavor::Task {
+                continue;
+            }
+
+            if find_task_type_for_id(graph, node_id)? == CuTaskType::Source {
+                continue;
+            }
+
+            let task_id = node.get_id().to_string();
+            let mission_inputs = collect_mission_task_inputs(graph, node_id, task_id.as_str())?;
+            task_mission_inputs
+                .entry(task_id)
+                .or_default()
+                .push((mission_name.clone(), mission_inputs));
+        }
+    }
+
+    let mut layouts = HashMap::new();
+    for (task_id, mission_inputs) in task_mission_inputs {
+        let mut mission_iter = mission_inputs.into_iter();
+        let Some((first_mission, first_inputs)) = mission_iter.next() else {
+            continue;
+        };
+
+        let slots: Vec<CanonicalTaskInputSlot> = first_inputs
+            .iter()
+            .map(|input| CanonicalTaskInputSlot {
+                msg_type: input.msg_type.clone(),
+                connection_orders: BTreeSet::from([input.connection_order]),
+            })
+            .collect();
+        let mut mission_slot_mappings = HashMap::new();
+        mission_slot_mappings.insert(
+            first_mission,
+            (0..first_inputs.len()).map(Some).collect::<Vec<_>>(),
+        );
+
+        let mut layout = TaskInputLayout {
+            slots,
+            mission_slot_mappings,
+        };
+        for (mission_name, mission_inputs) in mission_iter {
+            merge_task_input_layout(&task_id, &mut layout, mission_name, mission_inputs)?;
+        }
+
+        layouts.insert(task_id, layout);
+    }
+
+    Ok(layouts)
+}
+
+struct GeneratedTaskInput {
+    setup: proc_macro2::TokenStream,
+    expr: proc_macro2::TokenStream,
+}
+
+fn present_task_input_expr(
+    input: &cu29_runtime::curuntime::CuInputMsg,
+    output_pack_sizes: &[usize],
+) -> proc_macro2::TokenStream {
+    let input_index = int2sliceindex(input.culist_index);
+    let output_size = output_pack_sizes
+        .get(input.culist_index as usize)
+        .copied()
+        .unwrap_or_else(|| {
+            panic!(
+                "Missing output pack size for culist index {}",
+                input.culist_index
+            )
+        });
+    if output_size > 1 {
+        let port_index = syn::Index::from(input.src_port);
+        quote! { &msgs.#input_index.#port_index }
+    } else {
+        quote! { &msgs.#input_index }
+    }
+}
+
+fn generate_task_input_binding(
+    step: &CuExecutionStep,
+    mission_name: &str,
+    output_pack_sizes: &[usize],
+    task_input_layouts: &HashMap<String, TaskInputLayout>,
+) -> GeneratedTaskInput {
+    let task_id = step.node.get_id().to_string();
+    let layout = task_input_layouts
+        .get(&task_id)
+        .unwrap_or_else(|| panic!("Missing canonical input layout for task '{task_id}'"));
+    let slot_mapping = layout
+        .mission_slot_mappings
+        .get(mission_name)
+        .unwrap_or_else(|| {
+            panic!("Missing input slot mapping for task '{task_id}' in mission '{mission_name}'")
+        });
+
+    let mut setup = Vec::new();
+    let mut refs = Vec::new();
+
+    for (slot_index, slot) in layout.slots.iter().enumerate() {
+        if let Some(input_index) = slot_mapping.get(slot_index).copied().flatten() {
+            let input = step.input_msg_indices_types.get(input_index).unwrap_or_else(|| {
+                panic!(
+                    "Task '{task_id}' mission '{mission_name}' input slot {slot_index} mapped to missing input index {input_index}"
+                )
+            });
+            refs.push(present_task_input_expr(input, output_pack_sizes));
+            continue;
+        }
+
+        let empty_input_ident = format_ident!("__cu_missing_input_{slot_index}");
+        let input_ty: Type = parse_str(slot.msg_type.as_str()).unwrap_or_else(|err| {
+            panic!(
+                "Could not parse canonical input message type '{}' for task '{}': {err}",
+                slot.msg_type, task_id
+            )
+        });
+        setup.push(quote! {
+            let #empty_input_ident = cu29::cutask::CuMsg::<#input_ty>::new(None);
+        });
+        refs.push(quote! { &#empty_input_ident });
+    }
+
+    let expr = match refs.len() {
+        0 => quote! { &() },
+        1 => refs
+            .into_iter()
+            .next()
+            .expect("single input expression missing"),
+        _ => quote! { &( #(#refs),* ) },
+    };
+
+    GeneratedTaskInput {
+        setup: quote! { #(#setup)* },
+        expr,
+    }
+}
+
 /// Builds the tuple of the CuList as a tuple off all the output slots.
 fn build_culist_tuple(slot_types: &[Type]) -> TypeTuple {
     if slot_types.is_empty() {
         parse_quote! { () }
     } else {
-        parse_quote! { ( #( #slot_types ),* ) }
+        parse_quote! { ( #( #slot_types ),*, ) }
     }
 }
 
 /// This is the bincode encoding part of the CuStampedDataSet
-fn build_culist_tuple_encode(slot_types: &[Type]) -> ItemImpl {
-    let indices: Vec<usize> = (0..slot_types.len()).collect();
+fn build_culist_tuple_encode(
+    output_packs: &[OutputPack],
+    encode_helper_names: &[Option<Ident>],
+) -> ItemImpl {
+    let mut flat_idx = 0usize;
+    let mut encode_fields = Vec::new();
 
-    // Generate the `self.#i.encode(encoder)?` for each tuple index, including `()` types
-    let encode_fields: Vec<_> = indices
-        .iter()
-        .map(|i| {
-            let idx = syn::Index::from(*i);
-            quote! { self.0.#idx.encode(encoder)?; }
-        })
-        .collect();
+    for (slot_idx, pack) in output_packs.iter().enumerate() {
+        let slot_index = syn::Index::from(slot_idx);
+        if pack.is_multi() {
+            for port_idx in 0..pack.msg_types.len() {
+                let port_index = syn::Index::from(port_idx);
+                let cache_index = flat_idx;
+                let encode_helper = encode_helper_names[flat_idx].clone();
+                flat_idx += 1;
+                if let Some(encode_helper) = encode_helper {
+                    encode_fields.push(quote! {
+                        __cu_capture.select_slot(#cache_index);
+                        #encode_helper(&self.0.#slot_index.#port_index, encoder)?;
+                    });
+                } else {
+                    encode_fields.push(quote! {
+                        __cu_capture.select_slot(#cache_index);
+                        self.0.#slot_index.#port_index.encode(encoder)?;
+                    });
+                }
+            }
+        } else {
+            let cache_index = flat_idx;
+            let encode_helper = encode_helper_names[flat_idx].clone();
+            flat_idx += 1;
+            if let Some(encode_helper) = encode_helper {
+                encode_fields.push(quote! {
+                    __cu_capture.select_slot(#cache_index);
+                    #encode_helper(&self.0.#slot_index, encoder)?;
+                });
+            } else {
+                encode_fields.push(quote! {
+                    __cu_capture.select_slot(#cache_index);
+                    self.0.#slot_index.encode(encoder)?;
+                });
+            }
+        }
+    }
 
     parse_quote! {
         impl Encode for CuStampedDataSet {
             fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+                let __cu_capture = cu29::monitoring::start_copperlist_io_capture(&self.1);
                 #(#encode_fields)*
                 Ok(())
             }
@@ -3620,23 +6269,47 @@ fn build_culist_tuple_encode(slot_types: &[Type]) -> ItemImpl {
 }
 
 /// This is the bincode decoding part of the CuStampedDataSet
-fn build_culist_tuple_decode(slot_types: &[Type]) -> ItemImpl {
-    let indices: Vec<usize> = (0..slot_types.len()).collect();
-
-    let decode_fields: Vec<_> = indices
-        .iter()
-        .map(|i| {
-            let slot_type = &slot_types[*i];
-            quote! { <#slot_type as Decode<()>>::decode(decoder)? }
-        })
-        .collect();
+fn build_culist_tuple_decode(
+    output_packs: &[OutputPack],
+    slot_types: &[Type],
+    cumsg_count: usize,
+    decode_helper_names: &[Option<Ident>],
+) -> ItemImpl {
+    let mut flat_idx = 0usize;
+    let mut decode_fields = Vec::with_capacity(slot_types.len());
+    for (slot_idx, pack) in output_packs.iter().enumerate() {
+        let slot_type = &slot_types[slot_idx];
+        if pack.is_multi() {
+            let mut slot_fields = Vec::with_capacity(pack.msg_types.len());
+            for _ in 0..pack.msg_types.len() {
+                let decode_helper = decode_helper_names[flat_idx].clone();
+                flat_idx += 1;
+                if let Some(decode_helper) = decode_helper {
+                    slot_fields.push(quote! { #decode_helper(decoder)? });
+                } else {
+                    let msg_type = &pack.msg_types[slot_fields.len()];
+                    slot_fields.push(quote! { <CuMsg<#msg_type> as Decode<()>>::decode(decoder)? });
+                }
+            }
+            decode_fields.push(quote! { ( #(#slot_fields),* ) });
+        } else if let Some(decode_helper) = decode_helper_names[flat_idx].clone() {
+            flat_idx += 1;
+            decode_fields.push(quote! { #decode_helper(decoder)? });
+        } else {
+            flat_idx += 1;
+            decode_fields.push(quote! { <#slot_type as Decode<()>>::decode(decoder)? });
+        }
+    }
 
     parse_quote! {
         impl Decode<()> for CuStampedDataSet {
             fn decode<D: Decoder<Context=()>>(decoder: &mut D) -> Result<Self, DecodeError> {
-                Ok(CuStampedDataSet ((
-                    #(#decode_fields),*
-                )))
+                Ok(CuStampedDataSet(
+                    (
+                        #(#decode_fields),*,
+                    ),
+                    cu29::monitoring::CuMsgIoCache::<#cumsg_count>::default(),
+                ))
             }
         }
     }
@@ -3705,12 +6378,12 @@ fn build_culist_tuple_serialize(slot_types: &[Type]) -> ItemImpl {
         .collect();
 
     parse_quote! {
-        impl Serialize for CuStampedDataSet {
+        impl cu29::serde::ser::Serialize for CuStampedDataSet {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
-                S: serde::Serializer,
+                S: cu29::serde::Serializer,
             {
-                use serde::ser::SerializeTuple;
+                use cu29::serde::ser::SerializeTuple;
                 let mut tuple = serializer.serialize_tuple(#tuple_len)?;
                 #(tuple.serialize_element(#serialize_fields)?;)*
                 tuple.end()
@@ -3720,7 +6393,7 @@ fn build_culist_tuple_serialize(slot_types: &[Type]) -> ItemImpl {
 }
 
 /// This is the default implementation for CuStampedDataSet
-fn build_culist_tuple_default(slot_types: &[Type]) -> ItemImpl {
+fn build_culist_tuple_default(slot_types: &[Type], cumsg_count: usize) -> ItemImpl {
     let default_fields: Vec<_> = slot_types
         .iter()
         .map(|slot_type| quote! { <#slot_type as Default>::default() })
@@ -3730,9 +6403,12 @@ fn build_culist_tuple_default(slot_types: &[Type]) -> ItemImpl {
         impl Default for CuStampedDataSet {
             fn default() -> CuStampedDataSet
             {
-                CuStampedDataSet((
-                    #(#default_fields),*
-                ))
+                CuStampedDataSet(
+                    (
+                        #(#default_fields),*,
+                    ),
+                    cu29::monitoring::CuMsgIoCache::<#cumsg_count>::default(),
+                )
             }
         }
     }
@@ -4272,6 +6948,39 @@ fn build_execution_plan(
         });
     }
 
+    for (node_id, node) in graph.get_all_nodes() {
+        if node.get_flavor() != Flavor::Task {
+            continue;
+        }
+        let Some(task_index) = task_specs.node_id_to_task_index[node_id as usize] else {
+            continue;
+        };
+        if !task_specs
+            .autogenerated_output_flags
+            .get(task_index)
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let plan_node_id = *original_to_plan
+            .get(&node_id)
+            .unwrap_or_else(|| panic!("Task '{}' missing from mirrored plan graph", node.get_id()));
+        let task_kind = task_specs.cutypes[task_index];
+        let task_type: Type =
+            parse_str(task_specs.type_names[task_index].as_str()).unwrap_or_else(|err| {
+                panic!(
+                    "Could not parse task type '{}': {err}",
+                    task_specs.type_names[task_index]
+                )
+            });
+        let msg_type = synthesized_single_output_msg_name(&task_type, task_kind);
+        plan_graph
+            .get_node_mut(plan_node_id)
+            .unwrap_or_else(|| panic!("Plan node '{}' missing from mirrored graph", node.get_id()))
+            .add_nc_output(msg_type.as_str(), usize::MAX);
+    }
+
     for (bridge_index, spec) in bridge_specs.iter_mut().enumerate() {
         for (channel_index, channel_spec) in spec.rx_channels.iter_mut().enumerate() {
             let mut node = Node::new(
@@ -4477,6 +7186,113 @@ fn build_monitor_culist_component_mapping(
     Ok(mapping)
 }
 
+fn build_parallel_rt_stage_entries(
+    runtime_plan: &CuExecutionLoop,
+    exec_entities: &[ExecutionEntity],
+    task_specs: &CuTaskSpecSet,
+    bridge_specs: &[BridgeSpec],
+) -> CuResult<Vec<proc_macro2::TokenStream>> {
+    let mut entries = Vec::new();
+
+    for unit in &runtime_plan.steps {
+        let CuExecutionUnit::Step(step) = unit else {
+            todo!("parallel runtime metadata for nested loops is not implemented yet")
+        };
+
+        let entity = exec_entities.get(step.node_id as usize).ok_or_else(|| {
+            CuError::from(format!(
+                "Missing execution entity for runtime plan node {} while building parallel runtime metadata",
+                step.node_id
+            ))
+        })?;
+
+        let (label, kind_tokens, component_index) = match &entity.kind {
+            ExecutionEntityKind::Task { task_index } => (
+                task_specs
+                    .ids
+                    .get(*task_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CuError::from(format!(
+                            "Missing task id for task index {} while building parallel runtime metadata",
+                            task_index
+                        ))
+                    })?,
+                quote! { cu29::parallel_rt::ParallelRtStageKind::Task },
+                *task_index,
+            ),
+            ExecutionEntityKind::BridgeRx {
+                bridge_index,
+                channel_index,
+            } => {
+                let bridge = bridge_specs.get(*bridge_index).ok_or_else(|| {
+                    CuError::from(format!(
+                        "Missing bridge spec {} while building parallel runtime metadata",
+                        bridge_index
+                    ))
+                })?;
+                let channel = bridge.rx_channels.get(*channel_index).ok_or_else(|| {
+                    CuError::from(format!(
+                        "Missing bridge rx channel {}:{} while building parallel runtime metadata",
+                        bridge_index, channel_index
+                    ))
+                })?;
+                let component_index = channel.monitor_index.ok_or_else(|| {
+                    CuError::from(format!(
+                        "Missing monitor index for bridge rx {}:{} while building parallel runtime metadata",
+                        bridge_index, channel_index
+                    ))
+                })?;
+                (
+                    format!("bridge::{}::rx::{}", bridge.id, channel.id),
+                    quote! { cu29::parallel_rt::ParallelRtStageKind::BridgeRx },
+                    component_index,
+                )
+            }
+            ExecutionEntityKind::BridgeTx {
+                bridge_index,
+                channel_index,
+            } => {
+                let bridge = bridge_specs.get(*bridge_index).ok_or_else(|| {
+                    CuError::from(format!(
+                        "Missing bridge spec {} while building parallel runtime metadata",
+                        bridge_index
+                    ))
+                })?;
+                let channel = bridge.tx_channels.get(*channel_index).ok_or_else(|| {
+                    CuError::from(format!(
+                        "Missing bridge tx channel {}:{} while building parallel runtime metadata",
+                        bridge_index, channel_index
+                    ))
+                })?;
+                let component_index = channel.monitor_index.ok_or_else(|| {
+                    CuError::from(format!(
+                        "Missing monitor index for bridge tx {}:{} while building parallel runtime metadata",
+                        bridge_index, channel_index
+                    ))
+                })?;
+                (
+                    format!("bridge::{}::tx::{}", bridge.id, channel.id),
+                    quote! { cu29::parallel_rt::ParallelRtStageKind::BridgeTx },
+                    component_index,
+                )
+            }
+        };
+
+        let node_id = step.node_id;
+        entries.push(quote! {
+            cu29::parallel_rt::ParallelRtStageMetadata::new(
+                #label,
+                #kind_tokens,
+                #node_id,
+                cu29::monitoring::ComponentId::new(#component_index),
+            )
+        });
+    }
+
+    Ok(entries)
+}
+
 #[allow(dead_code)]
 fn build_monitored_ids(task_ids: &[String], bridge_specs: &mut [BridgeSpec]) -> Vec<String> {
     let mut names = task_ids.to_vec();
@@ -4495,16 +7311,329 @@ fn build_monitored_ids(task_ids: &[String], bridge_specs: &mut [BridgeSpec]) -> 
     names
 }
 
+fn wrap_process_step_tokens(
+    wrap_process_step: bool,
+    body: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if wrap_process_step {
+        quote! {{
+            let __cu_process_step_result: cu29::curuntime::ProcessStepResult = (|| {
+                #body
+                Ok(cu29::curuntime::ProcessStepOutcome::Continue)
+            })();
+            __cu_process_step_result
+        }}
+    } else {
+        body
+    }
+}
+
+fn abort_process_step_tokens(wrap_process_step: bool) -> proc_macro2::TokenStream {
+    if wrap_process_step {
+        quote! {
+            return Ok(cu29::curuntime::ProcessStepOutcome::AbortCopperList);
+        }
+    } else {
+        quote! {
+            __cu_abort_copperlist = true;
+            break '__cu_process_steps;
+        }
+    }
+}
+
+fn parallel_task_lifecycle_tokens(
+    task_kind: CuTaskType,
+    task_type: &Type,
+    component_index: usize,
+    mission_mod: &Ident,
+    task_instance: &proc_macro2::TokenStream,
+    placement: ParallelLifecyclePlacement,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let rt_guard = rtsan_guard_tokens();
+    let abort_process_step = abort_process_step_tokens(true);
+    let task_trait = match task_kind {
+        CuTaskType::Source => quote! { cu29::cutask::CuSrcTask },
+        CuTaskType::Sink => quote! { cu29::cutask::CuSinkTask },
+        CuTaskType::Regular => quote! { cu29::cutask::CuTask },
+    };
+
+    let preprocess = if placement.preprocess {
+        quote! {
+            execution_probe.record(cu29::monitoring::ExecutionMarker {
+                component_id: cu29::monitoring::ComponentId::new(#component_index),
+                step: CuComponentState::Preprocess,
+                culistid: Some(clid),
+            });
+            ctx.set_current_task(#component_index);
+            let maybe_error = {
+                #rt_guard
+                <#task_type as #task_trait>::preprocess(&mut #task_instance, &ctx)
+            };
+            if let Err(error) = maybe_error {
+                let decision = monitor.process_error(
+                    cu29::monitoring::ComponentId::new(#component_index),
+                    CuComponentState::Preprocess,
+                    &error,
+                );
+                match decision {
+                    Decision::Abort => {
+                        debug!(
+                            "Preprocess: ABORT decision from monitoring. Component '{}' errored out during preprocess. Aborting CopperList {}.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index)),
+                            clid
+                        );
+                        #abort_process_step
+                    }
+                    Decision::Ignore => {
+                        debug!(
+                            "Preprocess: IGNORE decision from monitoring. Component '{}' errored out during preprocess. The runtime will continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                    }
+                    Decision::Shutdown => {
+                        debug!(
+                            "Preprocess: SHUTDOWN decision from monitoring. Component '{}' errored out during preprocess. The runtime cannot continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                        return Err(CuError::new_with_cause(
+                            "Component errored out during preprocess.",
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let postprocess = if placement.postprocess {
+        quote! {
+            execution_probe.record(cu29::monitoring::ExecutionMarker {
+                component_id: cu29::monitoring::ComponentId::new(#component_index),
+                step: CuComponentState::Postprocess,
+                culistid: Some(clid),
+            });
+            ctx.set_current_task(#component_index);
+            let maybe_error = {
+                #rt_guard
+                <#task_type as #task_trait>::postprocess(&mut #task_instance, &ctx)
+            };
+            if let Err(error) = maybe_error {
+                let decision = monitor.process_error(
+                    cu29::monitoring::ComponentId::new(#component_index),
+                    CuComponentState::Postprocess,
+                    &error,
+                );
+                match decision {
+                    Decision::Abort => {
+                        debug!(
+                            "Postprocess: ABORT decision from monitoring. Component '{}' errored out during postprocess. Continuing with the completed CopperList.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                    }
+                    Decision::Ignore => {
+                        debug!(
+                            "Postprocess: IGNORE decision from monitoring. Component '{}' errored out during postprocess. The runtime will continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                    }
+                    Decision::Shutdown => {
+                        debug!(
+                            "Postprocess: SHUTDOWN decision from monitoring. Component '{}' errored out during postprocess. The runtime cannot continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                        return Err(CuError::new_with_cause(
+                            "Component errored out during postprocess.",
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    (preprocess, postprocess)
+}
+
+fn parallel_bridge_lifecycle_tokens(
+    bridge_type: &Type,
+    component_index: usize,
+    mission_mod: &Ident,
+    placement: ParallelLifecyclePlacement,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let rt_guard = rtsan_guard_tokens();
+    let abort_process_step = abort_process_step_tokens(true);
+
+    let preprocess = if placement.preprocess {
+        quote! {
+            execution_probe.record(cu29::monitoring::ExecutionMarker {
+                component_id: cu29::monitoring::ComponentId::new(#component_index),
+                step: CuComponentState::Preprocess,
+                culistid: Some(clid),
+            });
+            ctx.clear_current_task();
+            let maybe_error = {
+                #rt_guard
+                <#bridge_type as cu29::cubridge::CuBridge>::preprocess(bridge, &ctx)
+            };
+            if let Err(error) = maybe_error {
+                let decision = monitor.process_error(
+                    cu29::monitoring::ComponentId::new(#component_index),
+                    CuComponentState::Preprocess,
+                    &error,
+                );
+                match decision {
+                    Decision::Abort => {
+                        debug!(
+                            "Preprocess: ABORT decision from monitoring. Component '{}' errored out during preprocess. Aborting CopperList {}.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index)),
+                            clid
+                        );
+                        #abort_process_step
+                    }
+                    Decision::Ignore => {
+                        debug!(
+                            "Preprocess: IGNORE decision from monitoring. Component '{}' errored out during preprocess. The runtime will continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                    }
+                    Decision::Shutdown => {
+                        debug!(
+                            "Preprocess: SHUTDOWN decision from monitoring. Component '{}' errored out during preprocess. The runtime cannot continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                        return Err(CuError::new_with_cause(
+                            "Component errored out during preprocess.",
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let postprocess = if placement.postprocess {
+        quote! {
+            kf_manager.freeze_any(clid, bridge)?;
+            execution_probe.record(cu29::monitoring::ExecutionMarker {
+                component_id: cu29::monitoring::ComponentId::new(#component_index),
+                step: CuComponentState::Postprocess,
+                culistid: Some(clid),
+            });
+            ctx.clear_current_task();
+            let maybe_error = {
+                #rt_guard
+                <#bridge_type as cu29::cubridge::CuBridge>::postprocess(bridge, &ctx)
+            };
+            if let Err(error) = maybe_error {
+                let decision = monitor.process_error(
+                    cu29::monitoring::ComponentId::new(#component_index),
+                    CuComponentState::Postprocess,
+                    &error,
+                );
+                match decision {
+                    Decision::Abort => {
+                        debug!(
+                            "Postprocess: ABORT decision from monitoring. Component '{}' errored out during postprocess. Continuing with the completed CopperList.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                    }
+                    Decision::Ignore => {
+                        debug!(
+                            "Postprocess: IGNORE decision from monitoring. Component '{}' errored out during postprocess. The runtime will continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                    }
+                    Decision::Shutdown => {
+                        debug!(
+                            "Postprocess: SHUTDOWN decision from monitoring. Component '{}' errored out during postprocess. The runtime cannot continue.",
+                            #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#component_index))
+                        );
+                        return Err(CuError::new_with_cause(
+                            "Component errored out during postprocess.",
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    (preprocess, postprocess)
+}
+
+#[derive(Clone, Copy)]
+struct StepGenerationContext<'a> {
+    output_pack_sizes: &'a [usize],
+    task_input_layouts: &'a HashMap<String, TaskInputLayout>,
+    mission_name: &'a str,
+    sim_mode: bool,
+    mission_mod: &'a Ident,
+    lifecycle_placement: ParallelLifecyclePlacement,
+    wrap_process_step: bool,
+}
+
+impl<'a> StepGenerationContext<'a> {
+    fn new(
+        output_pack_sizes: &'a [usize],
+        task_input_layouts: &'a HashMap<String, TaskInputLayout>,
+        mission_name: &'a str,
+        sim_mode: bool,
+        mission_mod: &'a Ident,
+        lifecycle_placement: ParallelLifecyclePlacement,
+        wrap_process_step: bool,
+    ) -> Self {
+        Self {
+            output_pack_sizes,
+            task_input_layouts,
+            mission_name,
+            sim_mode,
+            mission_mod,
+            lifecycle_placement,
+            wrap_process_step,
+        }
+    }
+}
+
+struct TaskExecutionTokens {
+    setup: proc_macro2::TokenStream,
+    instance: proc_macro2::TokenStream,
+}
+
+impl TaskExecutionTokens {
+    fn new(setup: proc_macro2::TokenStream, instance: proc_macro2::TokenStream) -> Self {
+        Self { setup, instance }
+    }
+}
+
 fn generate_task_execution_tokens(
     step: &CuExecutionStep,
     task_index: usize,
     task_specs: &CuTaskSpecSet,
-    output_pack_sizes: &[usize],
-    sim_mode: bool,
-    mission_mod: &Ident,
+    ctx: StepGenerationContext<'_>,
+    task_tokens: TaskExecutionTokens,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
-    let node_index = int2sliceindex(task_index as u32);
-    let task_instance = quote! { tasks.#node_index };
+    let StepGenerationContext {
+        output_pack_sizes,
+        task_input_layouts,
+        mission_name,
+        sim_mode,
+        mission_mod,
+        lifecycle_placement,
+        wrap_process_step,
+    } = ctx;
+    let TaskExecutionTokens {
+        setup: task_setup,
+        instance: task_instance,
+    } = task_tokens;
+    let abort_process_step = abort_process_step_tokens(wrap_process_step);
     let comment_str = format!(
         "DEBUG ->> {} ({:?}) Id:{} I:{:?} O:{:?}",
         step.node.get_id(),
@@ -4538,6 +7667,15 @@ fn generate_task_execution_tokens(
     );
     let rt_guard = rtsan_guard_tokens();
     let run_in_sim_flag = task_specs.run_in_sim_flags[tid];
+    let task_type = &task_specs.task_types[tid];
+    let (parallel_task_preprocess, parallel_task_postprocess) = parallel_task_lifecycle_tokens(
+        step.task_type,
+        task_type,
+        tid,
+        mission_mod,
+        &task_instance,
+        lifecycle_placement,
+    );
     let maybe_sim_tick = if sim_mode && !run_in_sim_flag {
         quote! {
             if !doit {
@@ -4564,12 +7702,12 @@ fn generate_task_execution_tokens(
     let output_start_time = if output_ports.len() == 1 {
         quote! {
             if cumsg_output.metadata.process_time.start.is_none() {
-                cumsg_output.metadata.process_time.start = clock.now().into();
+                cumsg_output.metadata.process_time.start = cu29::curuntime::perf_now(clock).into();
             }
         }
     } else {
         quote! {
-            let start_time = clock.now().into();
+            let start_time = cu29::curuntime::perf_now(clock).into();
             #( if cumsg_output.#output_ports.metadata.process_time.start.is_none() {
                 cumsg_output.#output_ports.metadata.process_time.start = start_time;
             } )*
@@ -4578,12 +7716,12 @@ fn generate_task_execution_tokens(
     let output_end_time = if output_ports.len() == 1 {
         quote! {
             if cumsg_output.metadata.process_time.end.is_none() {
-                cumsg_output.metadata.process_time.end = clock.now().into();
+                cumsg_output.metadata.process_time.end = cu29::curuntime::perf_now(clock).into();
             }
         }
     } else {
         quote! {
-            let end_time = clock.now().into();
+            let end_time = cu29::curuntime::perf_now(clock).into();
             #( if cumsg_output.#output_ports.metadata.process_time.end.is_none() {
                 cumsg_output.#output_ports.metadata.process_time.end = end_time;
             } )*
@@ -4599,11 +7737,7 @@ fn generate_task_execution_tokens(
                     Decision::Abort => {
                         debug!("Process: ABORT decision from monitoring. Component '{}' errored out \
                                 during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#tid)), clid);
-                        ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                        cl_manager.end_of_processing(clid)?;
-                        monitor_result?;
-                        return Ok(());
+                        #abort_process_step
                     }
                     Decision::Ignore => {
                         debug!("Process: IGNORE decision from monitoring. Component '{}' errored out \
@@ -4684,8 +7818,11 @@ fn generate_task_execution_tokens(
             };
 
             (
-                quote! {
-                    {
+                wrap_process_step_tokens(
+                    wrap_process_step,
+                    quote! {
+                        #task_setup
+                        #parallel_task_preprocess
                         #comment_tokens
                         kf_manager.freeze_task(clid, &#task_instance)?;
                         #call_sim_callback
@@ -4704,40 +7841,22 @@ fn generate_task_execution_tokens(
                         if let Err(error) = maybe_error {
                             #monitoring_action
                         }
-                    }
-                },
+                        #parallel_task_postprocess
+                    },
+                ),
                 logging_tokens,
             )
         }
         CuTaskType::Sink => {
-            let input_exprs: Vec<proc_macro2::TokenStream> = step
-                .input_msg_indices_types
-                .iter()
-                .map(|input| {
-                    let input_index = int2sliceindex(input.culist_index);
-                    let output_size = output_pack_sizes
-                        .get(input.culist_index as usize)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Missing output pack size for culist index {}",
-                                input.culist_index
-                            )
-                        });
-                    if output_size > 1 {
-                        let port_index = syn::Index::from(input.src_port);
-                        quote! { msgs.#input_index.#port_index }
-                    } else {
-                        quote! { msgs.#input_index }
-                    }
-                })
-                .collect();
-            let inputs_type = if input_exprs.len() == 1 {
-                let input = input_exprs.first().unwrap();
-                quote! { #input }
-            } else {
-                quote! { (#(&#input_exprs),*) }
-            };
+            let GeneratedTaskInput {
+                setup: task_input_setup,
+                expr: task_input_expr,
+            } = generate_task_input_binding(
+                step,
+                mission_name,
+                output_pack_sizes,
+                task_input_layouts,
+            );
 
             let monitoring_action = quote! {
                 debug!("Component {}: Error during process: {}", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#tid)), &error);
@@ -4746,11 +7865,7 @@ fn generate_task_execution_tokens(
                     Decision::Abort => {
                         debug!("Process: ABORT decision from monitoring. Component '{}' errored out \
                                 during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#tid)), clid);
-                        ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                        cl_manager.end_of_processing(clid)?;
-                        monitor_result?;
-                        return Ok(());
+                        #abort_process_step
                     }
                     Decision::Ignore => {
                         debug!("Process: IGNORE decision from monitoring. Component '{}' errored out \
@@ -4769,7 +7884,7 @@ fn generate_task_execution_tokens(
             let call_sim_callback = if sim_mode {
                 quote! {
                     let doit = {
-                        let cumsg_input = &#inputs_type;
+                        let cumsg_input = #task_input_expr;
                         let cumsg_output = &mut msgs.#output_culist_index;
                         let state = CuTaskCallbackState::Process(cumsg_input, cumsg_output);
                         let ovr = sim_callback(SimStep::#enum_name(state));
@@ -4788,12 +7903,16 @@ fn generate_task_execution_tokens(
             };
 
             (
-                quote! {
-                    {
+                wrap_process_step_tokens(
+                    wrap_process_step,
+                    quote! {
+                        #task_setup
+                        #parallel_task_preprocess
                         #comment_tokens
                         kf_manager.freeze_task(clid, &#task_instance)?;
+                        #task_input_setup
                         #call_sim_callback
-                        let cumsg_input = &#inputs_type;
+                        let cumsg_input = #task_input_expr;
                         let cumsg_output = &mut msgs.#output_culist_index;
                         let maybe_error = if doit {
                             execution_probe.record(cu29::monitoring::ExecutionMarker {
@@ -4815,40 +7934,22 @@ fn generate_task_execution_tokens(
                         if let Err(error) = maybe_error {
                             #monitoring_action
                         }
-                    }
-                },
+                        #parallel_task_postprocess
+                    },
+                ),
                 quote! {},
             )
         }
         CuTaskType::Regular => {
-            let input_exprs: Vec<proc_macro2::TokenStream> = step
-                .input_msg_indices_types
-                .iter()
-                .map(|input| {
-                    let input_index = int2sliceindex(input.culist_index);
-                    let output_size = output_pack_sizes
-                        .get(input.culist_index as usize)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "Missing output pack size for culist index {}",
-                                input.culist_index
-                            )
-                        });
-                    if output_size > 1 {
-                        let port_index = syn::Index::from(input.src_port);
-                        quote! { msgs.#input_index.#port_index }
-                    } else {
-                        quote! { msgs.#input_index }
-                    }
-                })
-                .collect();
-            let inputs_type = if input_exprs.len() == 1 {
-                let input = input_exprs.first().unwrap();
-                quote! { #input }
-            } else {
-                quote! { (#(&#input_exprs),*) }
-            };
+            let GeneratedTaskInput {
+                setup: task_input_setup,
+                expr: task_input_expr,
+            } = generate_task_input_binding(
+                step,
+                mission_name,
+                output_pack_sizes,
+                task_input_layouts,
+            );
 
             let monitoring_action = quote! {
                 debug!("Component {}: Error during process: {}", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#tid)), &error);
@@ -4857,11 +7958,7 @@ fn generate_task_execution_tokens(
                     Decision::Abort => {
                         debug!("Process: ABORT decision from monitoring. Component '{}' errored out \
                                 during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#tid)), clid);
-                        ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                        cl_manager.end_of_processing(clid)?;
-                        monitor_result?;
-                        return Ok(());
+                        #abort_process_step
                     }
                     Decision::Ignore => {
                         debug!("Process: IGNORE decision from monitoring. Component '{}' errored out \
@@ -4880,7 +7977,7 @@ fn generate_task_execution_tokens(
             let call_sim_callback = if sim_mode {
                 quote! {
                     let doit = {
-                        let cumsg_input = &#inputs_type;
+                        let cumsg_input = #task_input_expr;
                         let cumsg_output = &mut msgs.#output_culist_index;
                         let state = CuTaskCallbackState::Process(cumsg_input, cumsg_output);
                         let ovr = sim_callback(SimStep::#enum_name(state));
@@ -4944,12 +8041,16 @@ fn generate_task_execution_tokens(
             };
 
             (
-                quote! {
-                    {
+                wrap_process_step_tokens(
+                    wrap_process_step,
+                    quote! {
+                        #task_setup
+                        #parallel_task_preprocess
                         #comment_tokens
                         kf_manager.freeze_task(clid, &#task_instance)?;
+                        #task_input_setup
                         #call_sim_callback
-                        let cumsg_input = &#inputs_type;
+                        let cumsg_input = #task_input_expr;
                         let cumsg_output = &mut msgs.#output_culist_index;
                         let maybe_error = if doit {
                             execution_probe.record(cu29::monitoring::ExecutionMarker {
@@ -4964,8 +8065,9 @@ fn generate_task_execution_tokens(
                         if let Err(error) = maybe_error {
                             #monitoring_action
                         }
-                    }
-                },
+                        #parallel_task_postprocess
+                    },
+                ),
                 logging_tokens,
             )
         }
@@ -4976,11 +8078,20 @@ fn generate_bridge_rx_execution_tokens(
     step: &CuExecutionStep,
     bridge_spec: &BridgeSpec,
     channel_index: usize,
-    mission_mod: &Ident,
-    sim_mode: bool,
+    ctx: StepGenerationContext<'_>,
+    bridge_setup: proc_macro2::TokenStream,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let StepGenerationContext {
+        output_pack_sizes: _,
+        task_input_layouts: _,
+        mission_name: _,
+        sim_mode,
+        mission_mod,
+        lifecycle_placement,
+        wrap_process_step,
+    } = ctx;
     let rt_guard = rtsan_guard_tokens();
-    let bridge_tuple_index = int2sliceindex(bridge_spec.tuple_index as u32);
+    let abort_process_step = abort_process_step_tokens(wrap_process_step);
     let channel = &bridge_spec.rx_channels[channel_index];
     let output_pack = step
         .output_msg_pack
@@ -5009,6 +8120,15 @@ fn generate_bridge_rx_execution_tokens(
             .expect("Bridge Rx channel missing monitor index"),
     );
     let bridge_type = runtime_bridge_type_for_spec(bridge_spec, sim_mode);
+    let (parallel_bridge_preprocess, parallel_bridge_postprocess) =
+        parallel_bridge_lifecycle_tokens(
+            &bridge_type,
+            bridge_spec
+                .monitor_index
+                .expect("Bridge missing monitor index for lifecycle"),
+            mission_mod,
+            lifecycle_placement,
+        );
     let const_ident = &channel.const_ident;
     let enum_ident = Ident::new(
         &config_id_to_enum(&format!("{}_rx_{}", bridge_spec.id, channel.id)),
@@ -5029,11 +8149,7 @@ fn generate_bridge_rx_execution_tokens(
                     match decision {
                         Decision::Abort => {
                             debug!("Process: ABORT decision from monitoring. Component '{}' errored out during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)), clid);
-                            ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                            cl_manager.end_of_processing(clid)?;
-                            monitor_result?;
-                            return Ok(());
+                            #abort_process_step
                         }
                         Decision::Ignore => {
                             debug!("Process: IGNORE decision from monitoring. Component '{}' errored out during process. The runtime will continue with a forced empty message.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)));
@@ -5054,9 +8170,11 @@ fn generate_bridge_rx_execution_tokens(
         quote! { let doit = true; }
     };
     (
-        quote! {
-            {
-                let bridge = &mut __cu_bridges.#bridge_tuple_index;
+        wrap_process_step_tokens(
+            wrap_process_step,
+            quote! {
+                #bridge_setup
+                #parallel_bridge_preprocess
                 let cumsg_output = #output_ref;
                 #call_sim_callback
                 if doit {
@@ -5065,7 +8183,7 @@ fn generate_bridge_rx_execution_tokens(
                         step: CuComponentState::Process,
                         culistid: Some(clid),
                     });
-                    cumsg_output.metadata.process_time.start = clock.now().into();
+                    cumsg_output.metadata.process_time.start = cu29::curuntime::perf_now(clock).into();
                     let maybe_error = {
                         #rt_guard
                         ctx.clear_current_task();
@@ -5075,17 +8193,13 @@ fn generate_bridge_rx_execution_tokens(
                             cumsg_output,
                         )
                     };
-                    cumsg_output.metadata.process_time.end = clock.now().into();
+                    cumsg_output.metadata.process_time.end = cu29::curuntime::perf_now(clock).into();
                     if let Err(error) = maybe_error {
                         let decision = monitor.process_error(cu29::monitoring::ComponentId::new(#monitor_index), CuComponentState::Process, &error);
                         match decision {
                             Decision::Abort => {
                                 debug!("Process: ABORT decision from monitoring. Component '{}' errored out during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)), clid);
-                                ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                                cl_manager.end_of_processing(clid)?;
-                                monitor_result?;
-                                return Ok(());
+                                #abort_process_step
                             }
                             Decision::Ignore => {
                                 debug!("Process: IGNORE decision from monitoring. Component '{}' errored out during process. The runtime will continue with a forced empty message.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)));
@@ -5098,8 +8212,9 @@ fn generate_bridge_rx_execution_tokens(
                         }
                     }
                 }
-            }
-        },
+                #parallel_bridge_postprocess
+            },
+        ),
         quote! {},
     )
 }
@@ -5108,11 +8223,20 @@ fn generate_bridge_tx_execution_tokens(
     step: &CuExecutionStep,
     bridge_spec: &BridgeSpec,
     channel_index: usize,
-    output_pack_sizes: &[usize],
-    mission_mod: &Ident,
-    sim_mode: bool,
+    ctx: StepGenerationContext<'_>,
+    bridge_setup: proc_macro2::TokenStream,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let StepGenerationContext {
+        output_pack_sizes,
+        task_input_layouts: _,
+        mission_name: _,
+        sim_mode,
+        mission_mod,
+        lifecycle_placement,
+        wrap_process_step,
+    } = ctx;
     let rt_guard = rtsan_guard_tokens();
+    let abort_process_step = abort_process_step_tokens(wrap_process_step);
     let channel = &bridge_spec.tx_channels[channel_index];
     let monitor_index = syn::Index::from(
         channel
@@ -5152,8 +8276,16 @@ fn generate_bridge_tx_execution_tokens(
     }
     let output_index = int2sliceindex(output_pack.culist_index);
     let output_ref = quote! { &mut msgs.#output_index };
-    let bridge_tuple_index = int2sliceindex(bridge_spec.tuple_index as u32);
     let bridge_type = runtime_bridge_type_for_spec(bridge_spec, sim_mode);
+    let (parallel_bridge_preprocess, parallel_bridge_postprocess) =
+        parallel_bridge_lifecycle_tokens(
+            &bridge_type,
+            bridge_spec
+                .monitor_index
+                .expect("Bridge missing monitor index for lifecycle"),
+            mission_mod,
+            lifecycle_placement,
+        );
     let const_ident = &channel.const_ident;
     let enum_ident = Ident::new(
         &config_id_to_enum(&format!("{}_tx_{}", bridge_spec.id, channel.id)),
@@ -5166,6 +8298,7 @@ fn generate_bridge_tx_execution_tokens(
                 let state = SimStep::#enum_ident {
                     channel: &<#bridge_type as cu29::cubridge::CuBridge>::Tx::#const_ident,
                     msg: &*cumsg_input,
+                    output: cumsg_output,
                 };
                 let ovr = sim_callback(state);
                 if let SimOverride::Errored(reason) = ovr  {
@@ -5174,11 +8307,7 @@ fn generate_bridge_tx_execution_tokens(
                     match decision {
                         Decision::Abort => {
                             debug!("Process: ABORT decision from monitoring. Component '{}' errored out during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)), clid);
-                            ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                            cl_manager.end_of_processing(clid)?;
-                            monitor_result?;
-                            return Ok(());
+                            #abort_process_step
                         }
                         Decision::Ignore => {
                             debug!("Process: IGNORE decision from monitoring. Component '{}' errored out during process. The runtime will continue with a forced empty message.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)));
@@ -5198,11 +8327,14 @@ fn generate_bridge_tx_execution_tokens(
         quote! { let doit = true; }
     };
     (
-        quote! {
-            {
-                let bridge = &mut __cu_bridges.#bridge_tuple_index;
+        wrap_process_step_tokens(
+            wrap_process_step,
+            quote! {
+                #bridge_setup
+                #parallel_bridge_preprocess
                 let cumsg_input = #input_ref;
                 let cumsg_output = #output_ref;
+                let bridge_channel = &<#bridge_type as cu29::cubridge::CuBridge>::Tx::#const_ident;
                 #call_sim_callback
                 if doit {
                     execution_probe.record(cu29::monitoring::ExecutionMarker {
@@ -5210,26 +8342,26 @@ fn generate_bridge_tx_execution_tokens(
                         step: CuComponentState::Process,
                         culistid: Some(clid),
                     });
-                    cumsg_output.metadata.process_time.start = clock.now().into();
-                    let maybe_error = {
-                        #rt_guard
-                        ctx.clear_current_task();
-                        bridge.send(
-                            &ctx,
-                            &<#bridge_type as cu29::cubridge::CuBridge>::Tx::#const_ident,
-                            &*cumsg_input,
-                        )
+                    cumsg_output.metadata.process_time.start = cu29::curuntime::perf_now(clock).into();
+                    let maybe_error = if bridge_channel.should_send(cumsg_input.payload().is_some()) {
+                        {
+                            #rt_guard
+                            ctx.clear_current_task();
+                            bridge.send(
+                                &ctx,
+                                bridge_channel,
+                                &*cumsg_input,
+                            )
+                        }
+                    } else {
+                        Ok(())
                     };
                     if let Err(error) = maybe_error {
                         let decision = monitor.process_error(cu29::monitoring::ComponentId::new(#monitor_index), CuComponentState::Process, &error);
                         match decision {
                             Decision::Abort => {
                                 debug!("Process: ABORT decision from monitoring. Component '{}' errored out during process. Skipping the processing of CL {}.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)), clid);
-                                ctx.clear_current_task();
-                        let monitor_result = monitor.process_copperlist(&ctx, #mission_mod::MONITOR_LAYOUT.view(&#mission_mod::collect_metadata(&culist)));
-                                cl_manager.end_of_processing(clid)?;
-                                monitor_result?;
-                                return Ok(());
+                                #abort_process_step
                             }
                             Decision::Ignore => {
                                 debug!("Process: IGNORE decision from monitoring. Component '{}' errored out during process. The runtime will continue with a forced empty message.", #mission_mod::monitor_component_label(cu29::monitoring::ComponentId::new(#monitor_index)));
@@ -5240,10 +8372,11 @@ fn generate_bridge_tx_execution_tokens(
                             }
                         }
                     }
-                    cumsg_output.metadata.process_time.end = clock.now().into();
+                    cumsg_output.metadata.process_time.end = cu29::curuntime::perf_now(clock).into();
                 }
-            }
-        },
+                #parallel_bridge_postprocess
+            },
+        ),
         quote! {},
     )
 }
@@ -5284,6 +8417,65 @@ struct BridgeSpec {
     monitor_index: Option<usize>,
     rx_channels: Vec<BridgeChannelSpec>,
     tx_channels: Vec<BridgeChannelSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ParallelLifecyclePlacement {
+    preprocess: bool,
+    postprocess: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ParallelLifecycleKey {
+    Task(usize),
+    Bridge(usize),
+}
+
+fn build_parallel_lifecycle_placements(
+    culist_plan: &CuExecutionLoop,
+    culist_exec_entities: &[ExecutionEntity],
+) -> Vec<ParallelLifecyclePlacement> {
+    let step_keys: Vec<Option<ParallelLifecycleKey>> = culist_plan
+        .steps
+        .iter()
+        .map(|unit| match unit {
+            CuExecutionUnit::Step(step) => {
+                match &culist_exec_entities[step.node_id as usize].kind {
+                    ExecutionEntityKind::Task { task_index } => {
+                        Some(ParallelLifecycleKey::Task(*task_index))
+                    }
+                    ExecutionEntityKind::BridgeRx { bridge_index, .. }
+                    | ExecutionEntityKind::BridgeTx { bridge_index, .. } => {
+                        Some(ParallelLifecycleKey::Bridge(*bridge_index))
+                    }
+                }
+            }
+            CuExecutionUnit::Loop(_) => None,
+        })
+        .collect();
+
+    let mut placements = vec![ParallelLifecyclePlacement::default(); step_keys.len()];
+    let mut seen_forward = std::collections::HashSet::new();
+    for (index, key) in step_keys.iter().enumerate() {
+        let Some(key) = key else {
+            continue;
+        };
+        if seen_forward.insert(*key) {
+            placements[index].preprocess = true;
+        }
+    }
+
+    let mut seen_reverse = std::collections::HashSet::new();
+    for (index, key) in step_keys.iter().enumerate().rev() {
+        let Some(key) = key else {
+            continue;
+        };
+        if seen_reverse.insert(*key) {
+            placements[index].postprocess = true;
+        }
+    }
+
+    placements
 }
 
 fn sim_bridge_channel_set_idents(bridge_tuple_index: usize) -> (Ident, Ident, Ident, Ident) {
@@ -5337,6 +8529,24 @@ enum ExecutionEntityKind {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cu29_derive_{name}_{nanos}"))
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        fs::write(path, content).expect("write file");
+    }
+
     // See tests/compile_file directory for more information
     #[test]
     fn test_compile_fail() {
@@ -5420,7 +8630,7 @@ mod tests {
             read_config("tests/config/multi_output_source_non_first_connected_valid.ron")
                 .expect("failed to read test config");
         let graph = config.get_graph(None).expect("missing graph");
-        let task_specs = CuTaskSpecSet::from_graph(graph);
+        let task_specs = CuTaskSpecSet::from_graph(graph).expect("task specs");
         let channel_usage = collect_bridge_channel_usage(graph);
         let mut bridge_specs = build_bridge_specs(&config, graph, &channel_usage);
         let (runtime_plan, exec_entities, plan_to_original) =
@@ -5444,7 +8654,7 @@ mod tests {
             slot_origin_ids[*output_position] = Some(task_id);
         }
 
-        let flattened_ids = flatten_slot_origin_ids(&output_packs, slot_origin_ids);
+        let flattened_ids = flatten_slot_origin_ids(&output_packs, &slot_origin_ids);
 
         // src emits two messages (i32 + bool), both map to src.
         // sink contributes its own output slot (CuMsg<()>), mapped to sink.
@@ -5468,7 +8678,7 @@ mod tests {
         node.set_resources(Some(res));
         graph.add_node(node).expect("bridge node");
 
-        let task_specs = CuTaskSpecSet::from_graph(&graph);
+        let task_specs = CuTaskSpecSet::from_graph(&graph).expect("task specs");
         let bridge_spec = BridgeSpec {
             id: "radio".to_string(),
             type_path: parse_str("bridge::Dummy").unwrap(),
@@ -5495,5 +8705,153 @@ mod tests {
         assert_eq!(specs[0].binding_name, "serial");
         assert_eq!(specs[0].bundle_index, 0);
         assert_eq!(specs[0].resource_name, "serial0");
+    }
+
+    #[test]
+    fn copper_runtime_args_parse_subsystem_mode() {
+        use super::*;
+        use quote::quote;
+
+        let args = CopperRuntimeArgs::parse_tokens(quote!(
+            config = "multi_copper.ron",
+            subsystem = "ping",
+            sim_mode,
+            ignore_resources
+        ))
+        .expect("parse runtime args");
+
+        assert_eq!(args.config_path, "multi_copper.ron");
+        assert_eq!(args.subsystem_id.as_deref(), Some("ping"));
+        assert!(args.sim_mode);
+        assert!(args.ignore_resources);
+    }
+
+    #[test]
+    fn resolve_runtime_config_from_multi_config_selects_local_subsystem() {
+        use super::*;
+
+        let root = unique_test_dir("multi_runtime_resolve");
+        let alpha_config = root.join("alpha.ron");
+        let beta_config = root.join("beta.ron");
+        let network_config = root.join("multi.ron");
+
+        write_file(
+            &alpha_config,
+            r#"
+(
+    tasks: [
+        (id: "src", type: "AlphaSource", run_in_sim: true),
+        (id: "sink", type: "AlphaSink", run_in_sim: true),
+    ],
+    cnx: [
+        (src: "src", dst: "sink", msg: "u32"),
+    ],
+)
+"#,
+        );
+        write_file(
+            &beta_config,
+            r#"
+(
+    tasks: [
+        (id: "src", type: "BetaSource", run_in_sim: true),
+        (id: "sink", type: "BetaSink", run_in_sim: true),
+    ],
+    cnx: [
+        (src: "src", dst: "sink", msg: "u64"),
+    ],
+)
+"#,
+        );
+        write_file(
+            &network_config,
+            r#"
+(
+    subsystems: [
+        (id: "beta", config: "beta.ron"),
+        (id: "alpha", config: "alpha.ron"),
+    ],
+    interconnects: [],
+)
+"#,
+        );
+
+        let args = CopperRuntimeArgs {
+            config_path: "multi.ron".to_string(),
+            subsystem_id: Some("beta".to_string()),
+            sim_mode: false,
+            ignore_resources: false,
+        };
+
+        let resolved =
+            resolve_runtime_config_with_root(&args, &root).expect("resolve multi runtime config");
+
+        assert_eq!(resolved.subsystem_id.as_deref(), Some("beta"));
+        assert_eq!(resolved.subsystem_code, 1);
+        let graph = resolved
+            .local_config
+            .get_graph(None)
+            .expect("resolved local config graph");
+        assert!(graph.get_node_id_by_name("src").is_some());
+        assert!(resolved.bundled_local_config_content.contains("BetaSource"));
+    }
+
+    #[test]
+    fn resolve_runtime_config_rejects_missing_subsystem() {
+        use super::*;
+
+        let root = unique_test_dir("multi_runtime_missing_subsystem");
+        let alpha_config = root.join("alpha.ron");
+        let network_config = root.join("multi.ron");
+
+        write_file(
+            &alpha_config,
+            r#"
+(
+    tasks: [
+        (id: "src", type: "AlphaSource", run_in_sim: true),
+        (id: "sink", type: "AlphaSink", run_in_sim: true),
+    ],
+    cnx: [
+        (src: "src", dst: "sink", msg: "u32"),
+    ],
+)
+"#,
+        );
+        write_file(
+            &network_config,
+            r#"
+(
+    subsystems: [
+        (id: "alpha", config: "alpha.ron"),
+    ],
+    interconnects: [],
+)
+"#,
+        );
+
+        let args = CopperRuntimeArgs {
+            config_path: "multi.ron".to_string(),
+            subsystem_id: Some("missing".to_string()),
+            sim_mode: false,
+            ignore_resources: false,
+        };
+
+        let err = resolve_runtime_config_with_root(&args, &root).expect_err("missing subsystem");
+        assert!(err.to_string().contains("Subsystem 'missing'"));
+    }
+
+    #[test]
+    fn synthesized_single_output_type_name_parses_for_source_and_regular_tasks() {
+        use super::*;
+
+        let src_ty: Type = parse_quote!(SingleSource);
+        let regular_ty: Type = parse_quote!(RegularTask);
+
+        let src_name = synthesized_single_output_msg_name(&src_ty, CuTaskType::Source);
+        let regular_name = synthesized_single_output_msg_name(&regular_ty, CuTaskType::Regular);
+
+        parse_str::<Type>(src_name.as_str()).expect("source payload type should parse");
+        parse_str::<Type>(regular_name.as_str()).expect("regular payload type should parse");
     }
 }

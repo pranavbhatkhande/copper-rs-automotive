@@ -58,7 +58,7 @@ cargo nextest run --workspace $FEATURES_FLAG
 
 ## Environment Variables
 
-- `FEATURES_FLAG`: Pre-configured feature set including `mock,image,kornia,python,gst,faer,nalgebra,glam,debug_pane,bincode` (plus `cuda` when enabled)
+- `FEATURES_FLAG`: Pre-configured feature set including `mock`, `cu-sensor-payloads/image`, `kornia`, `python`, `gst`, `faer`, `nalgebra`, `glam`, `debug_pane`, and `bincode` (plus `cuda` when enabled)
 - `LLVM_CONFIG`, `LIBCLANG_PATH`: LLVM/Clang configuration
 - Platform-specific library paths automatically configured
 
@@ -67,6 +67,7 @@ cargo nextest run --workspace $FEATURES_FLAG
 **CUDA not accessible (Linux)**: Ensure NVIDIA drivers are installed, check `/dev/nvidia*` permissions
 **macOS OpenSSL issues**: PKG_CONFIG_PATH is automatically configured
 **LLVM library issues**: Symlinks created automatically in `$HOME/.nix-llvm-libs`
+For graphic issues with bevy, refer to https://github.com/bevyengine/bevy/blob/latest/docs/linux_dependencies.md#nix
 
 ## Notes
 

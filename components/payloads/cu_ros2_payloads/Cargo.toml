@@ -3,12 +3,18 @@ name = "cu-ros2-payloads"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "ROS2 Payloads that can be constructed from/to Copper Payloads for compatibility"
+
+[package.metadata.copper]
+kind = "payload"
+domains = ["payload/ros2"]
+environments = ["host"]
 
 [dependencies]
 compact_str = { workspace = true }

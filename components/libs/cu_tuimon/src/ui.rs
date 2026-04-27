@@ -1,12 +1,7 @@
 use crate::MonitorModel;
-#[cfg(feature = "log_pane")]
-use crate::logpane::StyledLine;
-use crate::model::ComponentStatus;
+use crate::model::{ComponentStatus, MonitorFooterIdentity};
 use crate::palette;
-use crate::system_info::{SystemInfo, default_system_info};
 use crate::tui_nodes::{Connection, NodeGraph, NodeLayout};
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect, Size};
@@ -20,8 +15,18 @@ use tui_widgets::scrollview::{ScrollView, ScrollViewState};
 
 use cu29::monitoring::{ComponentId, ComponentType, MonitorComponentMetadata};
 
+#[cfg(feature = "log_pane")]
+use crate::log_pane::{LogPane, SelectionPoint, StyledLine};
+
+#[cfg(feature = "sysinfo_pane")]
+use crate::sysinfo_pane::{SystemInfo, default_system_info};
+
+#[cfg(all(native, feature = "sysinfo_pane"))]
+use ansi_to_tui::IntoText;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MonitorScreen {
+    #[cfg(feature = "sysinfo_pane")]
     System,
     Dag,
     Latency,
@@ -43,6 +48,7 @@ pub enum ScrollDirection {
 pub enum MonitorUiAction {
     None,
     QuitRequested,
+
     #[cfg(feature = "log_pane")]
     CopyLogSelection(String),
 }
@@ -63,6 +69,11 @@ pub enum MonitorUiEvent {
         col: u16,
         row: u16,
     },
+    Scroll {
+        direction: ScrollDirection,
+        steps: usize,
+    },
+
     #[cfg(feature = "log_pane")]
     MouseDrag {
         col: u16,
@@ -72,10 +83,6 @@ pub enum MonitorUiEvent {
     MouseUp {
         col: u16,
         row: u16,
-    },
-    Scroll {
-        direction: ScrollDirection,
-        steps: usize,
     },
 }
 
@@ -88,7 +95,6 @@ pub struct MonitorUiOptions {
 struct TabDef {
     screen: MonitorScreen,
     label: &'static str,
-    key: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -115,125 +121,79 @@ struct HelpHitbox {
     height: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FooterBadge {
+    inner: String,
+    bg: Color,
+    fg: Color,
+}
+
 const TAB_DEFS: &[TabDef] = &[
+    #[cfg(feature = "sysinfo_pane")]
     TabDef {
         screen: MonitorScreen::System,
         label: "SYS",
-        key: "1",
     },
     TabDef {
         screen: MonitorScreen::Dag,
         label: "DAG",
-        key: "2",
     },
     TabDef {
         screen: MonitorScreen::Latency,
         label: "LAT",
-        key: "3",
     },
     TabDef {
         screen: MonitorScreen::CopperList,
         label: "BW",
-        key: "4",
     },
     TabDef {
         screen: MonitorScreen::MemoryPools,
         label: "MEM",
-        key: "5",
     },
     #[cfg(feature = "log_pane")]
     TabDef {
         screen: MonitorScreen::Logs,
         label: "LOG",
-        key: "6",
     },
 ];
-
-#[cfg(feature = "log_pane")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SelectionPoint {
-    row: usize,
-    col: usize,
-}
-
-#[cfg(feature = "log_pane")]
-#[derive(Clone, Copy, Debug, Default)]
-struct LogSelection {
-    anchor: Option<SelectionPoint>,
-    cursor: Option<SelectionPoint>,
-}
-
-#[cfg(feature = "log_pane")]
-impl LogSelection {
-    fn clear(&mut self) {
-        self.anchor = None;
-        self.cursor = None;
-    }
-
-    fn start(&mut self, point: SelectionPoint) {
-        self.anchor = Some(point);
-        self.cursor = Some(point);
-    }
-
-    fn update(&mut self, point: SelectionPoint) {
-        if self.anchor.is_some() {
-            self.cursor = Some(point);
-        }
-    }
-
-    fn range(&self) -> Option<(SelectionPoint, SelectionPoint)> {
-        let anchor = self.anchor?;
-        let cursor = self.cursor?;
-        if (anchor.row, anchor.col) <= (cursor.row, cursor.col) {
-            Some((anchor, cursor))
-        } else {
-            Some((cursor, anchor))
-        }
-    }
-}
 
 pub struct MonitorUi {
     model: MonitorModel,
     runtime_node_col_width: u16,
     active_screen: MonitorScreen,
-    system_info: SystemInfo,
     show_quit_hint: bool,
     tab_hitboxes: Vec<TabHitbox>,
     help_hitboxes: Vec<HelpHitbox>,
     nodes_scrollable_widget_state: NodesScrollableWidgetState,
     latency_scroll_state: ScrollViewState,
+
+    #[cfg(feature = "sysinfo_pane")]
+    system_info: SystemInfo,
+
     #[cfg(feature = "log_pane")]
-    log_area: Option<Rect>,
-    #[cfg(feature = "log_pane")]
-    log_lines: Vec<StyledLine>,
-    #[cfg(feature = "log_pane")]
-    log_selection: LogSelection,
-    #[cfg(feature = "log_pane")]
-    log_offset_from_bottom: usize,
+    log_pane: LogPane,
 }
 
 impl MonitorUi {
     pub fn new(model: MonitorModel, options: MonitorUiOptions) -> Self {
         let runtime_node_col_width = Self::compute_runtime_node_col_width(model.components());
         let nodes_scrollable_widget_state = NodesScrollableWidgetState::new(model.clone());
+
         Self {
             model,
             runtime_node_col_width,
             active_screen: MonitorScreen::Dag,
-            system_info: default_system_info(),
             show_quit_hint: options.show_quit_hint,
             tab_hitboxes: Vec::new(),
             help_hitboxes: Vec::new(),
             nodes_scrollable_widget_state,
             latency_scroll_state: ScrollViewState::default(),
+
+            #[cfg(feature = "sysinfo_pane")]
+            system_info: default_system_info(),
+
             #[cfg(feature = "log_pane")]
-            log_area: None,
-            #[cfg(feature = "log_pane")]
-            log_lines: Vec::new(),
-            #[cfg(feature = "log_pane")]
-            log_selection: LogSelection::default(),
-            #[cfg(feature = "log_pane")]
-            log_offset_from_bottom: 0,
+            log_pane: Default::default(),
         }
     }
 
@@ -253,14 +213,15 @@ impl MonitorUi {
         match event {
             MonitorUiEvent::Key(key) => self.handle_key(key),
             MonitorUiEvent::MouseDown { col, row } => self.click(col, row),
-            #[cfg(feature = "log_pane")]
-            MonitorUiEvent::MouseDrag { col, row } => self.drag_log_selection(col, row),
-            #[cfg(feature = "log_pane")]
-            MonitorUiEvent::MouseUp { col, row } => self.finish_log_selection(col, row),
             MonitorUiEvent::Scroll { direction, steps } => {
                 self.scroll(direction, steps);
                 MonitorUiAction::None
             }
+
+            #[cfg(feature = "log_pane")]
+            MonitorUiEvent::MouseDrag { col, row } => self.drag_log_selection(col, row),
+            #[cfg(feature = "log_pane")]
+            MonitorUiEvent::MouseUp { col, row } => self.finish_log_selection(col, row),
         }
     }
 
@@ -278,7 +239,9 @@ impl MonitorUi {
                         'k' => self.scroll(ScrollDirection::Up, 1),
                         'h' => self.scroll(ScrollDirection::Left, 5),
                         'l' => self.scroll(ScrollDirection::Right, 5),
-                        'q' if self.show_quit_hint => return MonitorUiAction::QuitRequested,
+                        'q' if self.show_quit_hint => {
+                            return MonitorUiAction::QuitRequested;
+                        }
                         _ => {}
                     }
                 }
@@ -338,13 +301,16 @@ impl MonitorUi {
                     self.latency_scroll_state.scroll_left();
                 }
             }
+
             #[cfg(feature = "log_pane")]
             (MonitorScreen::Logs, ScrollDirection::Up) => {
-                self.log_offset_from_bottom = self.log_offset_from_bottom.saturating_add(steps);
+                self.log_pane.offset_from_bottom =
+                    self.log_pane.offset_from_bottom.saturating_add(steps);
             }
             #[cfg(feature = "log_pane")]
             (MonitorScreen::Logs, ScrollDirection::Down) => {
-                self.log_offset_from_bottom = self.log_offset_from_bottom.saturating_sub(steps);
+                self.log_pane.offset_from_bottom =
+                    self.log_pane.offset_from_bottom.saturating_sub(steps);
             }
             _ => {}
         }
@@ -411,11 +377,14 @@ impl MonitorUi {
         );
 
         match self.active_screen {
-            MonitorScreen::System => self.draw_system_info(f, area),
             MonitorScreen::Dag => self.draw_nodes(f, area),
             MonitorScreen::Latency => self.draw_latency_table(f, area),
             MonitorScreen::CopperList => self.draw_copperlist_stats(f, area),
             MonitorScreen::MemoryPools => self.draw_memory_pools(f, area),
+
+            #[cfg(feature = "sysinfo_pane")]
+            MonitorScreen::System => self.draw_system_info(f, area),
+
             #[cfg(feature = "log_pane")]
             MonitorScreen::Logs => self.draw_logs(f, area),
         }
@@ -440,6 +409,7 @@ impl MonitorUi {
         self.model.components()[component_id.index()].id()
     }
 
+    #[cfg(feature = "sysinfo_pane")]
     fn draw_system_info(&self, f: &mut Frame, area: Rect) {
         const VERSION: &str = env!("CARGO_PKG_VERSION");
         let mut lines = vec![
@@ -447,16 +417,18 @@ impl MonitorUi {
             Line::raw(format!("   -> Copper v{VERSION}")),
             Line::raw(""),
         ];
-        let mut body = match &self.system_info {
-            #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-            SystemInfo::Ansi(raw) => raw
-                .clone()
-                .into_text()
-                .map(|text| text.to_owned())
-                .unwrap_or_else(|_| Text::from(raw.clone())),
-            #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-            SystemInfo::Rich(text) => text.clone(),
-        };
+
+        #[cfg(native)]
+        let mut body = self
+            .system_info
+            .clone()
+            .into_text()
+            .map(|text| text.to_owned())
+            .unwrap_or_else(|_| Text::from(self.system_info.clone()));
+
+        #[cfg(browser)]
+        let mut body = self.system_info.clone();
+
         palette::normalize_text_colors(&mut body, palette::FOREGROUND, palette::BACKGROUND);
         lines.append(&mut body.lines);
         lines.push(Line::raw(" "));
@@ -720,9 +692,9 @@ impl MonitorUi {
             .saturating_add(stats.structured_bytes_per_cl);
         let mem_total_display = format_bytes_or(mem_total, "unknown");
         let encoded_display = format_bytes_or(stats.encoded_bytes, "n/a");
-        let efficiency_display = if raw_total > 0 && stats.encoded_bytes > 0 {
-            let ratio = (stats.encoded_bytes as f64) / (raw_total as f64);
-            format!("{:.1}%", ratio * 100.0)
+        let space_saved_display = if raw_total > 0 && stats.encoded_bytes > 0 {
+            let saved = 1.0 - (stats.encoded_bytes as f64) / (raw_total as f64);
+            format!("{:.1}%", saved * 100.0)
         } else {
             "n/a".to_string()
         };
@@ -768,7 +740,7 @@ impl MonitorUi {
 
         let disk_rows = vec![
             row("CL serialized size", encoded_display),
-            row("CL encoding efficiency", efficiency_display),
+            row("Space saved", space_saved_display),
             row("Structured log / CL", structured_display),
             row("Structured BW", structured_bw),
             spacer.clone(),
@@ -815,19 +787,19 @@ impl MonitorUi {
 
     #[cfg(feature = "log_pane")]
     fn start_log_selection(&mut self, col: u16, row: u16) -> MonitorUiAction {
-        let Some(area) = self.log_area else {
-            self.log_selection.clear();
+        let Some(area) = self.log_pane.area else {
+            self.log_pane.selection.clear();
             return MonitorUiAction::None;
         };
         if !point_inside(col, row, area.x, area.y, area.width, area.height) {
-            self.log_selection.clear();
+            self.log_pane.selection.clear();
             return MonitorUiAction::None;
         }
 
         let Some(point) = self.log_selection_point(col, row) else {
             return MonitorUiAction::None;
         };
-        self.log_selection.start(point);
+        self.log_pane.selection.start(point);
         MonitorUiAction::None
     }
 
@@ -836,17 +808,17 @@ impl MonitorUi {
         let Some(point) = self.log_selection_point(col, row) else {
             return MonitorUiAction::None;
         };
-        self.log_selection.update(point);
+        self.log_pane.selection.update(point);
         MonitorUiAction::None
     }
 
     #[cfg(feature = "log_pane")]
     fn finish_log_selection(&mut self, col: u16, row: u16) -> MonitorUiAction {
         let Some(point) = self.log_selection_point(col, row) else {
-            self.log_selection.clear();
+            self.log_pane.selection.clear();
             return MonitorUiAction::None;
         };
-        self.log_selection.update(point);
+        self.log_pane.selection.update(point);
         self.selected_log_text()
             .map(MonitorUiAction::CopyLogSelection)
             .unwrap_or(MonitorUiAction::None)
@@ -854,7 +826,7 @@ impl MonitorUi {
 
     #[cfg(feature = "log_pane")]
     fn log_selection_point(&self, col: u16, row: u16) -> Option<SelectionPoint> {
-        let area = self.log_area?;
+        let area = self.log_pane.area?;
         if !point_inside(col, row, area.x, area.y, area.width, area.height) {
             return None;
         }
@@ -862,7 +834,7 @@ impl MonitorUi {
         let rel_row = (row - area.y) as usize;
         let rel_col = (col - area.x) as usize;
         let line_index = self.visible_log_offset(area).saturating_add(rel_row);
-        let line = self.log_lines.get(line_index)?;
+        let line = self.log_pane.lines.get(line_index)?;
         Some(SelectionPoint {
             row: line_index,
             col: rel_col.min(line.text.chars().count()),
@@ -872,9 +844,9 @@ impl MonitorUi {
     #[cfg(feature = "log_pane")]
     fn visible_log_offset(&self, area: Rect) -> usize {
         let visible_rows = area.height as usize;
-        let total_lines = self.log_lines.len();
+        let total_lines = self.log_pane.lines.len();
         let max_offset = total_lines.saturating_sub(visible_rows);
-        let offset_from_bottom = self.log_offset_from_bottom.min(max_offset);
+        let offset_from_bottom = self.log_pane.offset_from_bottom.min(max_offset);
         total_lines.saturating_sub(visible_rows.saturating_add(offset_from_bottom))
     }
 
@@ -886,14 +858,14 @@ impl MonitorUi {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
         let inner = block.inner(area);
-        self.log_area = Some(inner);
-        self.log_lines = self.model.log_lines();
+        self.log_pane.area = Some(inner);
+        self.log_pane.lines = self.model.log_lines();
 
         let visible_offset = self.visible_log_offset(inner);
-        if let Some((start, end)) = self.log_selection.range()
-            && (start.row >= self.log_lines.len() || end.row >= self.log_lines.len())
+        if let Some((start, end)) = self.log_pane.selection.range()
+            && (start.row >= self.log_pane.lines.len() || end.row >= self.log_pane.lines.len())
         {
-            self.log_selection.clear();
+            self.log_pane.selection.clear();
         }
 
         let paragraph = Paragraph::new(self.build_log_text(inner, visible_offset)).block(block);
@@ -904,12 +876,14 @@ impl MonitorUi {
     fn build_log_text(&self, area: Rect, visible_offset: usize) -> Text<'static> {
         let mut rendered_lines = Vec::new();
         let selection = self
-            .log_selection
+            .log_pane
+            .selection
             .range()
             .filter(|(start, end)| start != end);
         let selection_style = Style::default().bg(palette::BLUE).fg(palette::BACKGROUND);
         let visible_lines = self
-            .log_lines
+            .log_pane
+            .lines
             .iter()
             .skip(visible_offset)
             .take(area.height as usize);
@@ -946,17 +920,17 @@ impl MonitorUi {
 
     #[cfg(feature = "log_pane")]
     fn selected_log_text(&self) -> Option<String> {
-        let (start, end) = self.log_selection.range()?;
-        if start == end || self.log_lines.is_empty() {
+        let (start, end) = self.log_pane.selection.range()?;
+        if start == end || self.log_pane.lines.is_empty() {
             return None;
         }
-        if start.row >= self.log_lines.len() || end.row >= self.log_lines.len() {
+        if start.row >= self.log_pane.lines.len() || end.row >= self.log_pane.lines.len() {
             return None;
         }
 
         let mut selected = Vec::new();
         for row in start.row..=end.row {
-            let line = &self.log_lines[row];
+            let line = &self.log_pane.lines[row];
             let line_len = line.text.chars().count();
             let Some((start_col, end_col)) = line_selection_bounds(row, line_len, start, end)
             else {
@@ -984,7 +958,8 @@ impl MonitorUi {
         spans.push(Span::styled(" ", Style::default().bg(base_bg)));
         cursor_x = cursor_x.saturating_add(1);
 
-        for tab in TAB_DEFS {
+        for (i, tab) in TAB_DEFS.iter().enumerate() {
+            let key = ((b'1' + i as u8) as char).to_string();
             let is_active = self.active_screen == tab.screen;
             let bg = if is_active { active_bg } else { inactive_bg };
             let fg = if is_active { active_fg } else { inactive_fg };
@@ -993,7 +968,7 @@ impl MonitorUi {
             } else {
                 Style::default().fg(fg).bg(bg)
             };
-            let tab_width = segment_width(tab.key, tab.label);
+            let tab_width = segment_width(&key, tab.label);
             self.tab_hitboxes.push(TabHitbox {
                 screen: tab.screen,
                 x: cursor_x,
@@ -1006,7 +981,7 @@ impl MonitorUi {
             spans.push(Span::styled("", Style::default().fg(bg).bg(base_bg)));
             spans.push(Span::styled(" ", Style::default().bg(bg)));
             spans.push(Span::styled(
-                tab.key,
+                key,
                 Style::default()
                     .fg(key_fg)
                     .bg(bg)
@@ -1094,36 +1069,38 @@ impl MonitorUi {
             .block(Block::default().style(Style::default().bg(base_bg)));
         f.render_widget(help, area);
 
-        let clid_inner = {
-            let stats = self.model.inner.copperlist_stats.lock().unwrap();
-            let value = stats.last_seen_clid.unwrap_or(0);
-            format!(" CL {:020} ", value)
-        };
-        let clid_width = (clid_inner.chars().count() + 2) as u16;
-        if area.width > clid_width + 2 && area.height >= 1 {
-            let clid_area = Rect {
-                x: area
-                    .x
-                    .saturating_add(area.width.saturating_sub(clid_width + 1)),
-                y: area.y,
-                width: clid_width,
-                height: 1,
-            };
-            let badge_bg = Color::Rgb(216, 157, 63);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("", Style::default().fg(badge_bg).bg(base_bg)),
-                    Span::styled(
-                        clid_inner,
-                        Style::default()
-                            .fg(palette::BACKGROUND)
-                            .bg(badge_bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("", Style::default().fg(badge_bg).bg(base_bg)),
-                ])),
-                clid_area,
-            );
+        self.render_footer_badges(f, area, base_bg);
+    }
+
+    fn render_footer_badges(&self, f: &mut Frame, area: Rect, base_bg: Color) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let clid = self
+            .model
+            .inner
+            .copperlist_stats
+            .lock()
+            .unwrap()
+            .last_seen_clid
+            .unwrap_or(0);
+        let mut badges = footer_badges(self.model.footer_identity(), clid);
+        while !badges.is_empty() {
+            let (line, width) = footer_badge_line(&badges, base_bg);
+            if width <= area.width {
+                f.render_widget(
+                    Paragraph::new(line),
+                    Rect {
+                        x: area.x.saturating_add(area.width.saturating_sub(width)),
+                        y: area.y,
+                        width,
+                        height: 1,
+                    },
+                );
+                return;
+            }
+            badges.remove(0);
         }
     }
 }
@@ -1203,6 +1180,69 @@ mod tests {
         assert_eq!(resized_content_size, initial_content_size);
         assert_eq!(state.graph_cache.key, initial_key);
         assert_eq!(offset, Position::new(max_x, max_y));
+    }
+
+    #[test]
+    fn footer_badges_render_identity_in_requested_order() {
+        let badges = footer_badges(
+            MonitorFooterIdentity {
+                system_name: "robot-alpha".into(),
+                subsystem_name: Some("drivetrain".into()),
+                mission_name: "autonomous".into(),
+                instance_id: 42,
+            },
+            12846,
+        );
+
+        let labels = badges
+            .into_iter()
+            .map(|badge| badge.inner)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                " robot-alpha ".to_string(),
+                " drivetrain ".to_string(),
+                " 42 ".to_string(),
+                " autonomous ".to_string(),
+                " 00000000000000012846 ".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn footer_badges_skip_subsystem_when_absent() {
+        let badges = footer_badges(
+            MonitorFooterIdentity {
+                system_name: "robot-alpha".into(),
+                subsystem_name: None,
+                mission_name: "autonomous".into(),
+                instance_id: 42,
+            },
+            12846,
+        );
+
+        let labels = badges
+            .into_iter()
+            .map(|badge| badge.inner)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                " robot-alpha ".to_string(),
+                " 42 ".to_string(),
+                " autonomous ".to_string(),
+                " 00000000000000012846 ".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn clip_with_ellipsis_truncates_long_footer_values() {
+        assert_eq!(
+            clip_with_ellipsis("balancebot-simulator-east", 12),
+            "balancebo..."
+        );
     }
 
     fn test_monitor_model() -> MonitorModel {
@@ -1311,37 +1351,20 @@ fn segment_width(key: &str, label: &str) -> u16 {
 fn screen_for_tab_key(key: char) -> Option<MonitorScreen> {
     TAB_DEFS
         .iter()
-        .find(|tab| tab.key.len() == 1 && tab.key.starts_with(key))
-        .map(|tab| tab.screen)
+        .enumerate()
+        .find(|(i, _)| (b'1' + *i as u8) as char == key)
+        .map(|(_, tab)| tab.screen)
 }
 
 fn tab_key_hint() -> String {
-    let keys = TAB_DEFS.iter().map(|tab| tab.key).collect::<Vec<_>>();
-    if keys.is_empty() {
+    let n = TAB_DEFS.len();
+    if n == 0 {
         return "tabs".to_string();
     }
-
-    let numeric_keys = keys
-        .iter()
-        .map(|key| key.parse::<u8>())
-        .collect::<Result<Vec<_>, _>>();
-
-    if let Ok(numeric_keys) = numeric_keys {
-        let is_contiguous = numeric_keys
-            .windows(2)
-            .all(|window| window[1] == window[0].saturating_add(1));
-        if is_contiguous
-            && let (Some(first), Some(last)) = (numeric_keys.first(), numeric_keys.last())
-        {
-            return if first == last {
-                first.to_string()
-            } else {
-                format!("{first}-{last}")
-            };
-        }
+    if n == 1 {
+        return "1".to_string();
     }
-
-    keys.join("/")
+    format!("1-{n}")
 }
 
 #[cfg(feature = "log_pane")]
@@ -1808,6 +1831,91 @@ fn clip_tail(value: &str, max_chars: usize) -> String {
         .map(|(idx, _)| idx)
         .unwrap_or(value.len());
     value[start..].to_string()
+}
+
+fn clip_with_ellipsis(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let prefix: String = value.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
+}
+
+fn footer_badges(identity: MonitorFooterIdentity, clid: u64) -> Vec<FooterBadge> {
+    let mut badges = vec![FooterBadge {
+        inner: format!(
+            " {} ",
+            clip_with_ellipsis(identity.system_name.as_str(), 18)
+        ),
+        bg: Color::Rgb(92, 102, 150),
+        fg: Color::Rgb(236, 236, 236),
+    }];
+    if let Some(subsystem_name) = identity.subsystem_name {
+        badges.push(FooterBadge {
+            inner: format!(" {} ", clip_with_ellipsis(subsystem_name.as_str(), 18)),
+            bg: Color::Rgb(116, 88, 128),
+            fg: Color::Rgb(236, 236, 236),
+        });
+    }
+    badges.extend([
+        FooterBadge {
+            inner: format!(" {} ", identity.instance_id),
+            bg: Color::Rgb(136, 92, 78),
+            fg: Color::Rgb(248, 231, 176),
+        },
+        FooterBadge {
+            inner: format!(
+                " {} ",
+                clip_with_ellipsis(identity.mission_name.as_str(), 16)
+            ),
+            bg: Color::Rgb(86, 114, 98),
+            fg: Color::Rgb(236, 236, 236),
+        },
+        FooterBadge {
+            inner: format!(" {:020} ", clid),
+            bg: Color::Rgb(198, 146, 64),
+            fg: palette::BACKGROUND,
+        },
+    ]);
+    badges
+}
+
+fn footer_badge_line(badges: &[FooterBadge], base_bg: Color) -> (Line<'static>, u16) {
+    if badges.is_empty() {
+        return (Line::default(), 0);
+    }
+
+    let mut spans = Vec::with_capacity(badges.len().saturating_mul(2).saturating_add(1));
+    let mut width = 0u16;
+    spans.push(Span::styled(
+        "",
+        Style::default().fg(badges[0].bg).bg(base_bg),
+    ));
+    width = width.saturating_add(1);
+
+    for (idx, badge) in badges.iter().enumerate() {
+        spans.push(Span::styled(
+            badge.inner.clone(),
+            Style::default()
+                .fg(badge.fg)
+                .bg(badge.bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+        width = width.saturating_add(badge.inner.chars().count() as u16);
+
+        let next_bg = badges.get(idx + 1).map(|next| next.bg).unwrap_or(base_bg);
+        spans.push(Span::styled("", Style::default().fg(badge.bg).bg(next_bg)));
+        width = width.saturating_add(1);
+    }
+
+    (Line::from(spans), width)
 }
 
 fn initial_graph_scroll_offset(area: Rect, content_size: Size, graph_bounds: Size) -> Position {

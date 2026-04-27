@@ -1,5 +1,3 @@
-#[cfg(feature = "log_pane")]
-use crate::logpane::StyledLine;
 use compact_str::{CompactString, ToCompactString};
 use cu29::clock::CuDuration;
 use cu29::cutask::CuMsgMetadata;
@@ -7,16 +5,21 @@ use cu29::monitoring::{
     ComponentId, CopperListInfo, CopperListIoStats, CopperListView, CuDurationStatistics,
     CuMonitoringMetadata, MonitorComponentMetadata, MonitorTopology,
 };
-use cu29::prelude::{CuCompactString, CuTime, pool};
+use cu29::prelude::{CuCompactString, CuTime, pools_statistics};
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "log_pane")]
+use crate::log_pane::StyledLine;
 #[cfg(feature = "log_pane")]
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+
+#[cfg(native)]
 use std::time::{Duration, Instant};
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(browser)]
 use web_time::{Duration, Instant};
 
 const COPPERLIST_RATE_WINDOW: Duration = Duration::from_secs(1);
+
 #[cfg(feature = "log_pane")]
 const DEFAULT_LOG_CAPACITY: usize = 1_024;
 
@@ -28,20 +31,28 @@ pub struct MonitorModel {
 pub(crate) struct MonitorModelInner {
     pub(crate) components: &'static [MonitorComponentMetadata],
     pub(crate) topology: MonitorTopology,
+    pub(crate) system_name: CompactString,
+    pub(crate) subsystem_name: Option<CompactString>,
+    pub(crate) mission_name: CompactString,
+    pub(crate) instance_id: u32,
     pub(crate) component_stats: Mutex<ComponentStats>,
     pub(crate) component_statuses: Mutex<Vec<ComponentStatus>>,
     pub(crate) pool_stats: Mutex<Vec<PoolStats>>,
     pub(crate) copperlist_stats: Mutex<CopperListStats>,
+
     #[cfg(feature = "log_pane")]
     pub(crate) log_lines: Mutex<VecDeque<StyledLine>>,
 }
 
 impl MonitorModel {
     pub fn from_metadata(metadata: &CuMonitoringMetadata) -> Self {
-        Self::from_parts(
+        Self::from_parts_with_identity(
             metadata.components(),
             metadata.copperlist_info(),
             metadata.topology().clone(),
+            metadata.mission_id(),
+            metadata.subsystem_id(),
+            metadata.instance_id(),
         )
     }
 
@@ -49,6 +60,17 @@ impl MonitorModel {
         components: &'static [MonitorComponentMetadata],
         copperlist_info: CopperListInfo,
         topology: MonitorTopology,
+    ) -> Self {
+        Self::from_parts_with_identity(components, copperlist_info, topology, "default", None, 0)
+    }
+
+    fn from_parts_with_identity(
+        components: &'static [MonitorComponentMetadata],
+        copperlist_info: CopperListInfo,
+        topology: MonitorTopology,
+        mission_name: &str,
+        subsystem_name: Option<&str>,
+        instance_id: u32,
     ) -> Self {
         let component_count = components.len();
         let mut copperlist_stats = CopperListStats::new();
@@ -58,6 +80,12 @@ impl MonitorModel {
             inner: Arc::new(MonitorModelInner {
                 components,
                 topology,
+                system_name: cached_system_name(),
+                subsystem_name: subsystem_name
+                    .filter(|name| !name.trim().is_empty())
+                    .map(CompactString::from),
+                mission_name: CompactString::from(mission_name),
+                instance_id,
                 component_stats: Mutex::new(ComponentStats::new(
                     component_count,
                     CuDuration::from(Duration::from_secs(5)),
@@ -65,6 +93,7 @@ impl MonitorModel {
                 component_statuses: Mutex::new(vec![ComponentStatus::default(); component_count]),
                 pool_stats: Mutex::new(Vec::new()),
                 copperlist_stats: Mutex::new(copperlist_stats),
+
                 #[cfg(feature = "log_pane")]
                 log_lines: Mutex::new(VecDeque::with_capacity(DEFAULT_LOG_CAPACITY)),
             }),
@@ -81,6 +110,15 @@ impl MonitorModel {
 
     pub fn component_count(&self) -> usize {
         self.inner.components.len()
+    }
+
+    pub(crate) fn footer_identity(&self) -> MonitorFooterIdentity {
+        MonitorFooterIdentity {
+            system_name: self.inner.system_name.clone(),
+            subsystem_name: self.inner.subsystem_name.clone(),
+            mission_name: self.inner.mission_name.clone(),
+            instance_id: self.inner.instance_id,
+        }
     }
 
     pub fn set_copperlist_info(&self, info: CopperListInfo) {
@@ -183,13 +221,15 @@ impl MonitorModel {
     }
 
     pub fn refresh_pool_stats_from_runtime(&self) {
-        let pool_stats_data = pool::pools_statistics();
+        let pool_stats_data = pools_statistics();
         for (id, space_left, total_size, buffer_size) in pool_stats_data {
             self.upsert_pool_stat(id.to_string(), space_left, total_size, buffer_size);
         }
     }
+}
 
-    #[cfg(feature = "log_pane")]
+#[cfg(feature = "log_pane")]
+impl MonitorModel {
     pub fn push_log_line(&self, line: StyledLine) {
         if line.text.is_empty() {
             return;
@@ -202,7 +242,6 @@ impl MonitorModel {
         }
     }
 
-    #[cfg(feature = "log_pane")]
     pub fn log_lines(&self) -> Vec<StyledLine> {
         self.inner
             .log_lines
@@ -213,7 +252,6 @@ impl MonitorModel {
             .collect()
     }
 
-    #[cfg(feature = "log_pane")]
     pub fn log_line_count(&self) -> usize {
         self.inner.log_lines.lock().unwrap().len()
     }
@@ -298,6 +336,40 @@ pub(crate) struct PoolStats {
     pub(crate) handles_in_use: usize,
     pub(crate) handles_per_second: usize,
     last_update: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MonitorFooterIdentity {
+    pub(crate) system_name: CompactString,
+    pub(crate) subsystem_name: Option<CompactString>,
+    pub(crate) mission_name: CompactString,
+    pub(crate) instance_id: u32,
+}
+
+#[cfg(native)]
+fn cached_system_name() -> CompactString {
+    let mut buf = [0u8; 256];
+    let result = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if result == 0 {
+        let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        if let Ok(hostname) = core::str::from_utf8(&buf[..end]) {
+            let hostname = hostname.trim();
+            if !hostname.is_empty() {
+                return CompactString::from(hostname);
+            }
+        }
+    }
+    CompactString::from("unknown-host")
+}
+
+#[cfg(browser)]
+fn cached_system_name() -> CompactString {
+    web_sys::window()
+        .and_then(|window| window.location().hostname().ok())
+        .map(|hostname| hostname.trim().to_string())
+        .filter(|hostname| !hostname.is_empty())
+        .map(CompactString::from)
+        .unwrap_or_else(|| CompactString::from("browser"))
 }
 
 impl PoolStats {
@@ -417,5 +489,59 @@ fn compute_end_to_end_latency(msgs: &[&CuMsgMetadata]) -> CuDuration {
         end - start
     } else {
         CuDuration::MIN
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cu29::monitoring::{ComponentType, MonitorTopology};
+
+    #[test]
+    fn monitor_model_footer_identity_uses_metadata_and_runtime_instance() {
+        static COMPONENTS: &[MonitorComponentMetadata] = &[MonitorComponentMetadata::new(
+            "task",
+            ComponentType::Task,
+            None,
+        )];
+        static CULIST_COMPONENT_MAPPING: &[ComponentId] = &[ComponentId::new(0)];
+        let metadata = CuMonitoringMetadata::new(
+            CompactString::from("autonomous"),
+            COMPONENTS,
+            CULIST_COMPONENT_MAPPING,
+            CopperListInfo::new(0, 0),
+            MonitorTopology::default(),
+            None,
+        )
+        .expect("valid monitoring metadata")
+        .with_subsystem_id(Some("balancebot"))
+        .with_instance_id(7);
+
+        let model = MonitorModel::from_metadata(&metadata);
+
+        let identity = model.footer_identity();
+        assert_eq!(identity.subsystem_name.as_deref(), Some("balancebot"));
+        assert_eq!(identity.mission_name.as_str(), "autonomous");
+        assert_eq!(identity.instance_id, 7);
+        assert!(!identity.system_name.is_empty());
+    }
+
+    #[test]
+    fn monitor_model_footer_identity_omits_missing_subsystem() {
+        static COMPONENTS: &[MonitorComponentMetadata] = &[MonitorComponentMetadata::new(
+            "task",
+            ComponentType::Task,
+            None,
+        )];
+        let model = MonitorModel::from_parts(
+            COMPONENTS,
+            CopperListInfo::new(0, 0),
+            MonitorTopology::default(),
+        );
+
+        let identity = model.footer_identity();
+        assert!(identity.subsystem_name.is_none());
+        assert_eq!(identity.mission_name.as_str(), "default");
+        assert_eq!(identity.instance_id, 0);
     }
 }

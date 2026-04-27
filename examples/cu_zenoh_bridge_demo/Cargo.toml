@@ -3,6 +3,7 @@ name = "cu-zenoh-bridge-demo"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -16,11 +17,10 @@ default-run = "zenoh-ping"
 
 [dependencies]
 cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
-cu-zenoh-bridge = { path = "../../components/bridges/cu_zenoh_bridge", version = "0.13.0" }
+cu29-export = { workspace = true }
+cu-zenoh-bridge = { path = "../../components/bridges/cu_zenoh_bridge", version = "0.15.0" }
 serde = { workspace = true }
 bincode = { workspace = true }
-tempfile = { workspace = true }
 
 [[bin]]
 name = "zenoh-ping"
@@ -29,3 +29,15 @@ path = "src/bin/ping.rs"
 [[bin]]
 name = "zenoh-pong"
 path = "src/bin/pong.rs"
+
+[[bin]]
+name = "validate-multi-config"
+path = "src/bin/validate_multi_config.rs"
+
+[[bin]]
+name = "inspect-ping-provenance"
+path = "src/bin/inspect_ping_provenance.rs"
+
+[[bin]]
+name = "inspect-pong-provenance"
+path = "src/bin/inspect_pong_provenance.rs"

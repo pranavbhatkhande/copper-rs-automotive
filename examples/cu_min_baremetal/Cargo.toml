@@ -6,6 +6,7 @@ description = "This is a minimal example/smoke test of a baremetal (no_std) appl
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -14,9 +15,9 @@ repository.workspace = true
 
 publish = false
 [package.metadata.copper]
-embedded_only = true
+environments = ["embedded"]
 embedded_config = "examples/cu_min_baremetal/.cargo/config-nostd.toml"
-embedded_target = "aarch64-unknown-none"
+embedded_targets = ["aarch64-unknown-none"]
 embedded_no_default_features = true
 
 [[bin]]
@@ -31,10 +32,9 @@ required-features = ["std"]
 [dependencies]
 
 bincode = { workspace = true }
-cu29 = { path = "../../core/cu29", default-features = false, version = "0.13.0", features = [
+cu29 = { path = "../../core/cu29", default-features = false, version = "0.15.0", features = [
   "textlogs",
 ] } # default-features = false -> enables no-std for all cu29 dependencies
-cu29-helpers = { workspace = true, optional = true } # std only
 serde = { workspace = true }
 spin = { workspace = true }
 embedded-alloc = { workspace = true, features = ["llff"] }
@@ -47,5 +47,5 @@ cu29-export = { workspace = true, features = [
 ], optional = true }
 
 [features]
-default = ["std"]                                                         # Compile with --no-default-features to target no_std
-std = ["dep:cu29-helpers", "dep:cu29-export", "bincode/std", "serde/std"]
+default = ["std"]                                     # Compile with --no-default-features to target no_std
+std = ["dep:cu29-export", "bincode/std", "serde/std"]

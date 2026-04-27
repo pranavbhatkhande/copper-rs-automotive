@@ -5,11 +5,18 @@ description = "This is a driver for the WT901 IMU."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
+
+[package.metadata.copper]
+kind = "source"
+domains = ["sensor/imu"]
+environments = ["host"]
+host_os = ["linux"]
 
 [dependencies]
 cu29 = { workspace = true }
@@ -21,7 +28,6 @@ serde = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 cu29-traits = { workspace = true }
-cu29-helpers = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 embedded-hal = "1"

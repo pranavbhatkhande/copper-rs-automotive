@@ -4,6 +4,7 @@ description = "Mini test app to validate bridge scheduling semantics"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -20,19 +21,19 @@ path = "src/main.rs"
 clap = { workspace = true }
 cu29-export = { workspace = true }
 cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
 cu29-unifiedlog = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
-cu-consolemon = { path = "../../components/monitors/cu_consolemon", version = "0.13.0" }
+cu-consolemon = { path = "../../components/monitors/cu_consolemon", version = "0.15.0" }
 
 [[bin]]
 name = "resim"
 path = "src/resim.rs"
-required-features = ["reflect"]
+required-features = ["sim-debug"]
 
 [features]
 default = []
 macro_debug = ["cu29/macro_debug"]
 reflect = ["cu29/reflect"]
+sim-debug = ["reflect", "cu29/remote-debug"]

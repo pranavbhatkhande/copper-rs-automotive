@@ -1,6 +1,6 @@
 use clap::Parser;
 use cu_sensor_payloads::{CuImage, ImuPayload, PointCloud, PointCloudSoa};
-use cu_spatial_payloads::Transform3D as CuTransform3D;
+use cu_spatial_payloads::{GeodeticPosition as CuGeodeticPosition, Transform3D as CuTransform3D};
 use cu29::clock::Tov;
 use cu29::prelude::{
     CopperListTuple, CuError, CuResult, UnifiedLogType, UnifiedLogger, UnifiedLoggerBuilder,
@@ -69,6 +69,14 @@ where
     log_as_components(rec, path, transform)
 }
 
+pub fn log_geodetic_position(
+    rec: &RecordingStream,
+    path: &str,
+    position: &CuGeodeticPosition,
+) -> CuResult<()> {
+    log_as_components(rec, path, position)
+}
+
 pub fn log_imu(rec: &RecordingStream, base: &str, imu: &ImuPayload) -> CuResult<()> {
     log_scalar(rec, &format!("{}/accel_x", base), imu.accel_x.value as f64)?;
     log_scalar(rec, &format!("{}/accel_y", base), imu.accel_y.value as f64)?;
@@ -126,6 +134,13 @@ where
             .downcast_ref::<CuTransform3D<f64>>()
             .expect("downcast must match TypeId");
         return log_as_components(rec, path, transform);
+    }
+
+    if payload_id == TypeId::of::<CuGeodeticPosition>() {
+        let position = any_payload
+            .downcast_ref::<CuGeodeticPosition>()
+            .expect("downcast must match TypeId");
+        return log_geodetic_position(rec, path, position);
     }
 
     if payload_id == TypeId::of::<ImuPayload>() {
@@ -251,13 +266,14 @@ pub fn logviz_emit_dataset<P: LogvizDataSet>(dataset: &P, rec: &RecordingStream)
 
 pub fn run_cli<P>() -> CuResult<()>
 where
-    P: CopperListTuple + LogvizDataSet,
+    P: CopperListTuple + LogvizDataSet + 'static,
 {
     let args = LogVizCli::parse();
     let (rec, _guard) = args
         .rerun
         .init("cu29-logviz")
         .map_err(|e| CuError::from(format!("Failed to init rerun: {e}")))?;
+    let _ = cu29::logcodec::seed_effective_config_from_log::<P>(&args.unifiedlog_base)?;
     let dl = build_read_logger(&args.unifiedlog_base)?;
     let mut reader = UnifiedLoggerIOReader::new(dl, UnifiedLogType::CopperList);
     for culist in copperlists_reader::<P>(&mut reader) {

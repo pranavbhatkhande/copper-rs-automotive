@@ -1,3 +1,8 @@
+use crate::{CuHandlePayload, CuHandlePayloadInit, CuHandlePayloadMeta};
+use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+use alloc::boxed::Box;
+use bincode::de::Decoder;
+use bincode::error::DecodeError;
 use bincode::{Decode, Encode};
 use cu29::prelude::*;
 use cu29::units::si::f32::{Length, Ratio};
@@ -58,7 +63,37 @@ impl PointCloud {
     }
 }
 
+pub struct PointCloudSoaHandleMeta;
+
+impl CuHandlePayloadMeta for PointCloudSoaHandleMeta {
+    const TYPE_PATH: &'static str = "cu_sensor_payloads::PointCloudSoaHandle";
+    const SHORT_TYPE_PATH: &'static str = "PointCloudSoaHandle";
+    const TYPE_IDENT: Option<&'static str> = Some("PointCloudSoaHandle");
+    const CRATE_NAME: Option<&'static str> = Some("cu_sensor_payloads");
+    const MODULE_PATH: Option<&'static str> = Some("cu_sensor_payloads");
+}
+
+/// Copper point-cloud payload stored behind a `CuHandle` so large clouds do not live inline on
+/// the thread stack.
+pub type PointCloudSoaHandle<const N: usize> =
+    CuHandlePayload<PointCloudSoa<N>, PointCloudSoaHandleMeta>;
+
 impl<const N: usize> PointCloudSoa<N> {
+    /// Allocate a zeroed point cloud directly on the heap.
+    ///
+    /// SAFETY: `PointCloudSoa<N>` is generated from `PointCloud`, whose fields are `usize`, `u8`,
+    /// `u64` (`CuTime`), and `uom::Quantity<f32>` wrappers. The quantity type is
+    /// `#[repr(transparent)]` over its scalar plus `PhantomData`, so an all-zero bit pattern is a
+    /// valid semantic zero for every field in the generated SoA storage.
+    pub fn boxed_zeroed() -> Box<Self> {
+        let layout = Layout::new::<Self>();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        unsafe { Box::from_raw(ptr.cast()) }
+    }
+
     /// Sort in place the point cloud so it can be ready for merge sorts for example
     pub fn sort(&mut self) {
         self.quicksort(0, N - 1);
@@ -99,14 +134,55 @@ impl<const N: usize> PointCloudSoa<N> {
     }
 }
 
+impl<const N: usize> CuHandlePayloadInit for PointCloudSoa<N> {
+    fn boxed_init() -> Box<Self> {
+        Self::boxed_zeroed()
+    }
+
+    fn decode_boxed<D>(decoder: &mut D) -> Result<Box<Self>, DecodeError>
+    where
+        D: Decoder<Context = ()>,
+    {
+        let mut result = Self::boxed_zeroed();
+        result.len = Decode::decode(decoder)?;
+        if result.len > N {
+            return Err(DecodeError::ArrayLengthMismatch {
+                required: N,
+                found: result.len,
+            });
+        }
+
+        for idx in 0..result.len {
+            result.tov[idx] = Decode::decode(decoder)?;
+        }
+        for idx in 0..result.len {
+            result.x[idx] = Decode::decode(decoder)?;
+        }
+        for idx in 0..result.len {
+            result.y[idx] = Decode::decode(decoder)?;
+        }
+        for idx in 0..result.len {
+            result.z[idx] = Decode::decode(decoder)?;
+        }
+        for idx in 0..result.len {
+            result.i[idx] = Decode::decode(decoder)?;
+        }
+        for idx in 0..result.len {
+            result.return_order[idx] = Decode::decode(decoder)?;
+        }
+
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cu29_clock::CuDuration;
+    use cu29_clock::CuTime;
 
     #[test]
     fn test_point_payload() {
-        let payload = PointCloud::new(CuDuration(1), 1.0, 2.0, 3.0, 0.0, None);
+        let payload = PointCloud::new(CuTime::from_nanos(1), 1.0, 2.0, 3.0, 0.0, None);
         assert_eq!(payload.x.value, 1.0);
         assert_eq!(payload.y.value, 2.0);
         assert_eq!(payload.z.value, 3.0);

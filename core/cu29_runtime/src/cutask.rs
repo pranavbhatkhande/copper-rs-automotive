@@ -15,7 +15,7 @@ use compact_str::{CompactString, ToCompactString};
 use core::any::{TypeId, type_name};
 use cu29_clock::{PartialCuTimeRange, Tov};
 use cu29_traits::{
-    COMPACT_STRING_CAPACITY, CuCompactString, CuError, CuMsgMetadataTrait, CuResult,
+    COMPACT_STRING_CAPACITY, CuCompactString, CuError, CuMsgMetadataTrait, CuMsgOrigin, CuResult,
     ErasedCuStampedData, Metadata,
 };
 use serde::de::DeserializeOwned;
@@ -115,9 +115,6 @@ macro_rules! input_msg {
     ($lt:lifetime, $first:ty, $($rest:ty),+) => {
         ( & $lt CuMsg<$first>, $( & $lt CuMsg<$rest> ),+ )
     };
-    ($lt:lifetime, $ty:ty) => {
-        CuMsg<$ty>   // This is for backward compatibility
-    };
     ($ty:ty) => {
         CuMsg<$ty>
     };
@@ -135,9 +132,16 @@ macro_rules! output_msg {
     ($ty:ty) => {
         CuMsg<$ty>
     };
-    ($lt:lifetime, $ty:ty) => {
-        CuMsg<$ty>  // This is for backward compatibility
-    };
+}
+
+/// Helper trait used by codegen when Copper needs to treat a task output as a
+/// single message slot without relying on config-declared output edges.
+pub trait CuSingleOutputMsg {
+    type Payload: CuMsgPayload;
+}
+
+impl<T: CuMsgPayload> CuSingleOutputMsg for CuMsg<T> {
+    type Payload = T;
 }
 
 /// CuMsgMetadata is a structure that contains metadata common to all CuStampedDataSet.
@@ -149,6 +153,8 @@ pub struct CuMsgMetadata {
     /// A small string for real time feedback purposes.
     /// This is useful for to display on the field when the tasks are operating correctly.
     pub status_txt: CuCompactString,
+    /// Remote Copper provenance captured on receive, when available.
+    pub origin: Option<CuMsgOrigin>,
 }
 
 impl Metadata for CuMsgMetadata {}
@@ -156,6 +162,14 @@ impl Metadata for CuMsgMetadata {}
 impl CuMsgMetadata {
     pub fn set_status(&mut self, status: impl ToCompactString) {
         self.status_txt = CuCompactString(status.to_compact_string());
+    }
+
+    pub fn set_origin(&mut self, origin: CuMsgOrigin) {
+        self.origin = Some(origin);
+    }
+
+    pub fn clear_origin(&mut self) {
+        self.origin = None;
     }
 }
 
@@ -166,6 +180,10 @@ impl CuMsgMetadataTrait for CuMsgMetadata {
 
     fn status_txt(&self) -> &CuCompactString {
         &self.status_txt
+    }
+
+    fn origin(&self) -> Option<&CuMsgOrigin> {
+        self.origin.as_ref()
     }
 }
 
@@ -180,9 +198,7 @@ impl Display for CuMsgMetadata {
 }
 
 /// CuMsg is the envelope holding the msg payload and the metadata between tasks.
-#[derive(
-    Default, Debug, Clone, bincode::Encode, bincode::Decode, Serialize, Deserialize, Reflect,
-)]
+#[derive(Default, Debug, Clone, bincode::Decode, Serialize, Deserialize, Reflect)]
 #[reflect(opaque, from_reflect = false, no_field_bounds)]
 #[serde(bound(
     serialize = "T: Serialize, M: Serialize",
@@ -204,11 +220,44 @@ where
     pub metadata: M,
 }
 
+impl<T, M> Encode for CuStampedData<T, M>
+where
+    T: CuMsgPayload,
+    M: Metadata,
+{
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        match &self.payload {
+            None => {
+                0u8.encode(encoder)?;
+            }
+            Some(payload) => {
+                1u8.encode(encoder)?;
+                let encoded_start = cu29_traits::observed_encode_bytes();
+                let handle_start = crate::monitoring::current_payload_handle_bytes();
+                payload.encode(encoder)?;
+                let encoded_bytes =
+                    cu29_traits::observed_encode_bytes().saturating_sub(encoded_start);
+                let handle_bytes =
+                    crate::monitoring::current_payload_handle_bytes().saturating_sub(handle_start);
+                crate::monitoring::record_current_slot_payload_io_stats(
+                    core::mem::size_of::<T>(),
+                    encoded_bytes,
+                    handle_bytes,
+                );
+            }
+        }
+        self.tov.encode(encoder)?;
+        self.metadata.encode(encoder)?;
+        Ok(())
+    }
+}
+
 impl Default for CuMsgMetadata {
     fn default() -> Self {
         CuMsgMetadata {
             process_time: PartialCuTimeRange::default(),
             status_txt: CuCompactString(CompactString::with_capacity(COMPACT_STRING_CAPACITY)),
+            origin: None,
         }
     }
 }
@@ -218,12 +267,16 @@ where
     T: CuMsgPayload,
     M: Metadata,
 {
-    pub fn new(payload: Option<T>) -> Self {
+    pub(crate) fn from_parts(payload: Option<T>, tov: Tov, metadata: M) -> Self {
         CuStampedData {
             payload,
-            tov: Tov::default(),
-            metadata: M::default(),
+            tov,
+            metadata,
         }
+    }
+
+    pub fn new(payload: Option<T>) -> Self {
+        Self::from_parts(payload, Tov::default(), M::default())
     }
     pub fn payload(&self) -> Option<&T> {
         self.payload.as_ref()

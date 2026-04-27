@@ -154,7 +154,7 @@
 //! | `schema.get_stack` | yes | `{}` | stack config schema JSON |
 //! | `schema.list_types` | yes | `{ filter? }` | `type_paths[]` |
 //! | `schema.get_type` | yes | `{ type_path, format? }` | schema/reflect dump |
-//! | `schema.get_payload_map` | yes | `{}` | output index -> task id map |
+//! | `schema.get_outputs` | yes | `{}` | output index -> task/message/payload field metadata |
 //!
 //! ### State
 //!
@@ -226,19 +226,28 @@
 //! - Event publishers are declared and helper methods exist, but core handlers are
 //!   currently request/reply oriented and do not emit continuous event streams yet.
 
-use crate::app::CuSimApplication;
+use crate::app::{CuSimApplication, CurrentRuntimeCopperList};
 use crate::config::{BridgeChannelConfigRepresentation, Flavor, read_configuration_str};
 use crate::debug::{CuDebugSession, JumpOutcome};
-use crate::reflect::{ReflectTaskIntrospection, TypeInfo, TypeRegistry};
-use cu29_clock::{CuTime, RobotClock, RobotClockMock, Tov};
-use cu29_traits::{CopperListTuple, CuError, CuMsgMetadataTrait, CuResult, ErasedCuStampedDataSet};
+use crate::reflect::{
+    EnumInfo, Reflect, ReflectTaskIntrospection, StructInfo, TupleInfo, TupleStructInfo, Type,
+    TypeInfo, TypeRegistry, VariantInfo, serde::SerializationData,
+};
+use cu29_clock::{
+    CuTime, CuTimeRange, OptionCuTime, PartialCuTimeRange, RobotClock, RobotClockMock, Tov,
+};
+use cu29_traits::{
+    CopperListTuple, CuCompactString, CuError, CuMsgMetadataTrait, CuMsgOrigin, CuResult,
+    DebugFieldDescriptor, DebugFieldKind, DebugFieldSemantics, ErasedCuStampedDataSet,
+};
 use cu29_unifiedlog::{SectionStorage, UnifiedLogWrite};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zenoh::bytes::Encoding;
@@ -251,6 +260,60 @@ const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 64;
 const MAX_PAGE_LIMIT: u32 = 1000;
 const SERVER_RECV_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug, Serialize, Reflect)]
+struct DebugMessageMetadataView {
+    tov: Tov,
+    process_time: PartialCuTimeRange,
+    status_txt: String,
+    origin: Option<CuMsgOrigin>,
+}
+
+fn register_debug_support_types(registry: &mut TypeRegistry) {
+    registry.register::<DebugMessageMetadataView>();
+    registry.register::<crate::cutask::CuMsgMetadata>();
+    registry.register::<Tov>();
+    registry.register::<CuTimeRange>();
+    registry.register::<PartialCuTimeRange>();
+    registry.register::<OptionCuTime>();
+    registry.register::<CuTime>();
+    registry.register::<CuMsgOrigin>();
+    registry.register::<Option<CuMsgOrigin>>();
+}
+
+fn populate_debug_type_registry<App>(registry: &mut TypeRegistry)
+where
+    App: ReflectTaskIntrospection,
+{
+    <App as ReflectTaskIntrospection>::register_reflect_types(registry);
+    register_debug_support_types(registry);
+}
+
+fn append_builtin_debug_type_paths(paths: &mut Vec<String>) {
+    let compact_string = core::any::type_name::<CuCompactString>().to_string();
+    if !paths.iter().any(|path| path == &compact_string) {
+        paths.push(compact_string);
+    }
+}
+
+fn builtin_debug_type_schema(type_path: &str, format: &str) -> Option<Value> {
+    (type_path == core::any::type_name::<CuCompactString>()).then(|| {
+        if format == "jsonschema" {
+            json!({
+                "$schema": "https://json-schema.org/draft-07/schema#",
+                "title": type_path,
+                "description": "Copper compact status string wrapper",
+                "type": "string",
+            })
+        } else {
+            json!({
+                "type_path": type_path,
+                "reflect_dump": "opaque scalar string wrapper",
+            })
+        }
+    })
+}
+const REGISTRY_DIR_NAME: &str = "cu29_remote_debug_registry";
 
 type ZenohSubscriber =
     zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
@@ -356,6 +419,34 @@ pub struct SessionOpenParams {
     pub role: Option<String>,
     #[serde(default)]
     pub codecs: Option<Vec<WireCodec>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteDebugProcessInfo {
+    pub pid: u32,
+    pub debug_base: String,
+    pub executable_path: PathBuf,
+    pub working_dir: PathBuf,
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub restart_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub log_base: Option<PathBuf>,
+    pub registered_at_unix_ns: u64,
+}
+
+impl RemoteDebugProcessInfo {
+    pub fn display_name(&self) -> String {
+        self.executable_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("target")
+            .to_owned()
+    }
+
+    pub fn command_args(&self) -> &[String] {
+        self.argv.get(1..).unwrap_or(&[])
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +575,10 @@ struct HealthPingParams {}
 #[allow(dead_code)]
 struct HealthStatsParams {}
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(dead_code)]
+struct ProcessDescribeParams {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Page {
     offset: u32,
@@ -541,7 +636,7 @@ struct QueryCursorSnapshot {
 
 struct SessionState<App, P, CB, TF, S, L>
 where
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     S: SectionStorage,
     L: UnifiedLogWrite<S> + 'static,
 {
@@ -558,7 +653,7 @@ where
 
 impl<App, P, CB, TF, S, L> SessionState<App, P, CB, TF, S, L>
 where
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     S: SectionStorage,
     L: UnifiedLogWrite<S> + 'static,
 {
@@ -615,6 +710,186 @@ fn local_socket_path(base: &str) -> PathBuf {
 
 fn local_endpoint(base: &str) -> String {
     format!("unixsock-stream/{}", local_socket_path(base).display())
+}
+
+pub fn remote_debug_registry_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(REGISTRY_DIR_NAME)
+}
+
+pub fn remove_remote_debug_registry_entry(debug_base: &str) -> std::io::Result<()> {
+    let path = remote_debug_registry_entry_path(debug_base);
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+pub fn load_remote_debug_registry_entries() -> CuResult<Vec<RemoteDebugProcessInfo>> {
+    let dir = remote_debug_registry_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(CuError::from(format!(
+                "RemoteDebug: failed to read registry dir '{}': {err}",
+                dir.display()
+            )));
+        }
+    };
+
+    let mut processes = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(process) = serde_json::from_str::<RemoteDebugProcessInfo>(&contents) else {
+            continue;
+        };
+        processes.push(process);
+    }
+
+    Ok(processes)
+}
+
+fn remote_debug_registry_entry_path(debug_base: &str) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    debug_base.hash(&mut hasher);
+    let id = hasher.finish();
+    remote_debug_registry_dir().join(format!("{id:016x}.json"))
+}
+
+fn capture_current_process_info(default_debug_base: &str) -> RemoteDebugProcessInfo {
+    let argv = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let executable_path = std::env::current_exe().unwrap_or_else(|_| {
+        argv.first()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("unknown"))
+    });
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let debug_base =
+        extract_flag_value(&argv, "--debug-base").unwrap_or_else(|| default_debug_base.to_owned());
+    let log_base = extract_flag_value(&argv, "--log-base")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                working_dir.join(path)
+            }
+        })
+        .map(normalize_remote_debug_log_base_path);
+
+    RemoteDebugProcessInfo {
+        pid: std::process::id(),
+        debug_base,
+        executable_path,
+        working_dir,
+        argv,
+        restart_env: collect_restart_env(),
+        log_base,
+        registered_at_unix_ns: now_unix_ns(),
+    }
+}
+
+fn extract_flag_value(args: &[String], flag: &str) -> Option<String> {
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return args.get(idx + 1).cloned();
+        }
+        if let Some((prefix, value)) = arg.split_once('=')
+            && prefix == flag
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn normalize_remote_debug_log_base_path(path: PathBuf) -> PathBuf {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return path;
+    };
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return path;
+    };
+    let Some((base_stem, slab_suffix)) = stem.rsplit_once('_') else {
+        return path;
+    };
+
+    if slab_suffix.is_empty() || !slab_suffix.chars().all(|c| c.is_ascii_digit()) {
+        return path;
+    }
+
+    let normalized = path.with_file_name(format!("{base_stem}.{extension}"));
+    let Some(normalized_stem) = normalized.file_stem().and_then(|stem| stem.to_str()) else {
+        return path;
+    };
+    let Some(normalized_extension) = normalized.extension().and_then(|ext| ext.to_str()) else {
+        return path;
+    };
+    let slab_zero =
+        normalized.with_file_name(format!("{normalized_stem}_0.{normalized_extension}"));
+    if slab_zero.exists() { normalized } else { path }
+}
+
+fn collect_restart_env() -> BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(key, _)| should_capture_restart_env(key))
+        .collect()
+}
+
+fn should_capture_restart_env(key: &str) -> bool {
+    matches!(
+        key,
+        "DYLD_FALLBACK_LIBRARY_PATH"
+            | "DYLD_LIBRARY_PATH"
+            | "LD_LIBRARY_PATH"
+            | "PATH"
+            | "PYTHONPATH"
+            | "RUST_BACKTRACE"
+            | "RUST_LOG"
+    ) || key.starts_with("COPPER_")
+        || key.starts_with("ZENOH_")
+}
+
+struct RemoteDebugRegistryRegistration {
+    entry_path: PathBuf,
+}
+
+impl RemoteDebugRegistryRegistration {
+    fn register(process: &RemoteDebugProcessInfo) -> std::io::Result<Self> {
+        let entry_path = remote_debug_registry_entry_path(&process.debug_base);
+        if let Some(parent) = entry_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = entry_path.with_extension("json.tmp");
+        let contents = serde_json::to_vec_pretty(process)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        fs::write(&temp_path, contents)?;
+        fs::rename(temp_path, &entry_path)?;
+
+        Ok(Self { entry_path })
+    }
+}
+
+impl Drop for RemoteDebugRegistryRegistration {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.entry_path);
+    }
 }
 
 fn set_config_json5(config: &mut ZenohConfig, key: &str, value: &str) -> CuResult<()> {
@@ -696,13 +971,14 @@ struct EventPublishers {
 
 pub struct RemoteDebugZenohServer<App, P, CB, TF, S, L, AF>
 where
-    App: CuSimApplication<S, L> + ReflectTaskIntrospection,
+    App: CuSimApplication<S, L> + ReflectTaskIntrospection + CurrentRuntimeCopperList<P>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
             &'a crate::copperlist::CopperList<P>,
             RobotClock,
+            RobotClockMock,
         )
             -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>
         + Clone,
@@ -721,19 +997,21 @@ where
     next_watch_id: u64,
     next_op_id: u64,
     stop_requested: bool,
-    stack_schema: Value,
     session_lifecycle: SessionLifecycleLimits,
+    process_info: RemoteDebugProcessInfo,
+    _registry_registration: Option<RemoteDebugRegistryRegistration>,
 }
 
 impl<App, P, CB, TF, S, L, AF> RemoteDebugZenohServer<App, P, CB, TF, S, L, AF>
 where
-    App: CuSimApplication<S, L> + ReflectTaskIntrospection,
+    App: CuSimApplication<S, L> + ReflectTaskIntrospection + CurrentRuntimeCopperList<P>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
             &'a crate::copperlist::CopperList<P>,
             RobotClock,
+            RobotClockMock,
         )
             -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>
         + Clone,
@@ -782,7 +1060,14 @@ where
                 cu_error_map("RemoteDebug: failed to declare health events publisher"),
             )?;
 
-        let stack_schema = build_stack_schema::<App, S, L>()?;
+        let process_info = capture_current_process_info(&paths.base);
+        let registry_registration = match RemoteDebugRegistryRegistration::register(&process_info) {
+            Ok(registration) => Some(registration),
+            Err(err) => {
+                eprintln!("RemoteDebug: failed to register process metadata: {err}");
+                None
+            }
+        };
 
         Ok(Self {
             paths,
@@ -802,8 +1087,9 @@ where
             next_watch_id: 1,
             next_op_id: 1,
             stop_requested: false,
-            stack_schema,
             session_lifecycle: SessionLifecycleLimits::default(),
+            process_info,
+            _registry_registration: registry_registration,
         })
     }
 
@@ -948,8 +1234,8 @@ where
                 request.session_id.as_deref(),
                 &request.params,
             ),
-            "schema.get_payload_map" => {
-                self.handle_schema_get_payload_map(request_id, request.session_id.as_deref())
+            "schema.get_outputs" => {
+                self.handle_schema_get_outputs(request_id, request.session_id.as_deref())
             }
             "state.inspect" => self.handle_state_inspect(
                 request_id,
@@ -978,6 +1264,11 @@ where
             "health.stats" => {
                 self.handle_health_stats(request_id, request.session_id.as_deref(), &request.params)
             }
+            "process.describe" => self.handle_process_describe(
+                request_id,
+                request.session_id.as_deref(),
+                &request.params,
+            ),
             _ => err_response(
                 request_id,
                 "UnknownMethod",
@@ -1566,7 +1857,11 @@ where
         if let Err(e) = self.session_mut(session_id) {
             return err_response(request_id, "SessionNotFound", &e.to_string());
         }
-        ok_response(request_id, self.stack_schema.clone(), None, None)
+
+        match build_stack_schema::<App, S, L>() {
+            Ok(schema) => ok_response(request_id, schema, None, None),
+            Err(err) => err_response(request_id, "SchemaFailed", &err.to_string()),
+        }
     }
 
     fn handle_schema_list_types(
@@ -1585,12 +1880,13 @@ where
         };
 
         let mut registry = TypeRegistry::default();
-        <App as ReflectTaskIntrospection>::register_reflect_types(&mut registry);
+        populate_debug_type_registry::<App>(&mut registry);
 
         let mut paths: Vec<String> = registry
             .iter()
             .map(|registration| registration.type_info().type_path().to_string())
             .collect();
+        append_builtin_debug_type_paths(&mut paths);
         paths.sort();
         paths.dedup();
 
@@ -1617,7 +1913,11 @@ where
         };
 
         let mut registry = TypeRegistry::default();
-        <App as ReflectTaskIntrospection>::register_reflect_types(&mut registry);
+        populate_debug_type_registry::<App>(&mut registry);
+
+        if let Some(schema) = builtin_debug_type_schema(&parsed.type_path, &parsed.format) {
+            return ok_response(request_id, json!({ "schema": schema }), None, None);
+        }
 
         let info = match registry.get_with_type_path(&parsed.type_path) {
             Some(reg) => reg.type_info(),
@@ -1642,7 +1942,7 @@ where
         ok_response(request_id, json!({"schema": schema}), None, None)
     }
 
-    fn handle_schema_get_payload_map(
+    fn handle_schema_get_outputs(
         &mut self,
         request_id: String,
         session_id: Option<&str>,
@@ -1651,18 +1951,13 @@ where
             return err_response(request_id, "SessionNotFound", &e.to_string());
         }
 
-        let outputs: Vec<Value> = P::get_all_task_ids()
-            .iter()
-            .enumerate()
-            .map(|(index, task_id)| {
-                json!({
-                    "index": index,
-                    "task_id": task_id,
-                })
-            })
-            .collect();
+        let mut registry = TypeRegistry::default();
+        populate_debug_type_registry::<App>(&mut registry);
 
-        ok_response(request_id, json!({"outputs": outputs}), None, None)
+        match build_output_schema_entries::<P>(&registry) {
+            Ok(outputs) => ok_response(request_id, json!({ "outputs": outputs }), None, None),
+            Err(err) => err_response(request_id, "SchemaFailed", &err.to_string()),
+        }
     }
 
     fn handle_state_inspect(
@@ -2097,6 +2392,28 @@ where
             now.saturating_duration_since(state.last_touched_at) <= idle_timeout
         });
     }
+
+    fn handle_process_describe(
+        &mut self,
+        request_id: String,
+        session_id: Option<&str>,
+        _params: &Value,
+    ) -> DebugRpcResponse {
+        if let Some(sid) = session_id
+            && self.session_mut(Some(sid)).is_err()
+        {
+            return err_response(request_id, "SessionNotFound", "session not found");
+        }
+
+        match serde_json::to_value(&self.process_info) {
+            Ok(value) => ok_response(request_id, value, None, None),
+            Err(err) => err_response(
+                request_id,
+                "ProcessDescribeFailed",
+                &format!("failed encoding process metadata: {err}"),
+            ),
+        }
+    }
 }
 
 fn ok_response(
@@ -2298,7 +2615,8 @@ fn capabilities_json(session_lifecycle: SessionLifecycleLimits) -> Value {
             "state.watch.open",
             "state.watch.close",
             "health.ping",
-            "health.stats"
+            "health.stats",
+            "process.describe"
         ]
     })
 }
@@ -2349,7 +2667,7 @@ fn update_after_jump<App, P, CB, TF, S, L>(
     state: &mut SessionState<App, P, CB, TF, S, L>,
     jump: &JumpOutcome,
 ) where
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     S: SectionStorage,
     L: UnifiedLogWrite<S> + 'static,
 {
@@ -2363,13 +2681,14 @@ fn seek_to_index<App, P, CB, TF, S, L>(
     idx: usize,
 ) -> CuResult<JumpOutcome>
 where
-    App: CuSimApplication<S, L>,
+    App: CuSimApplication<S, L> + CurrentRuntimeCopperList<P>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2384,13 +2703,14 @@ fn replay_current_step<App, P, CB, TF, S, L>(
     session: &mut CuDebugSession<App, P, CB, TF, S, L>,
 ) -> CuResult<JumpOutcome>
 where
-    App: CuSimApplication<S, L>,
+    App: CuSimApplication<S, L> + CurrentRuntimeCopperList<P>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2415,10 +2735,11 @@ where
     App: CuSimApplication<S, L>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2450,10 +2771,11 @@ where
     App: CuSimApplication<S, L>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2479,10 +2801,11 @@ where
     App: CuSimApplication<S, L>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2577,7 +2900,7 @@ where
     }
 }
 
-fn copperlist_snapshot<P: CopperListTuple>(
+fn copperlist_snapshot<P: CopperListTuple + 'static>(
     cl: &crate::copperlist::CopperList<P>,
     time_of: &impl Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime>,
     include_payloads: bool,
@@ -2632,29 +2955,15 @@ fn copperlist_snapshot<P: CopperListTuple>(
 }
 
 fn metadata_to_json(metadata: &dyn CuMsgMetadataTrait, tov: Tov) -> Value {
-    let process = metadata.process_time();
-    let start: Option<CuTime> = process.start.into();
-    let end: Option<CuTime> = process.end.into();
-    json!({
-        "tov": tov_to_json(tov),
-        "process_time": {
-            "start_ns": start.map(|t| t.as_nanos()),
-            "end_ns": end.map(|t| t.as_nanos()),
-        },
-        "status_txt": metadata.status_txt().0.to_string(),
-    })
-}
+    let view = DebugMessageMetadataView {
+        tov,
+        process_time: metadata.process_time(),
+        status_txt: metadata.status_txt().0.to_string(),
+        origin: metadata.origin().cloned(),
+    };
 
-fn tov_to_json(tov: Tov) -> Value {
-    match tov {
-        Tov::None => json!({"kind": "none"}),
-        Tov::Time(t) => json!({"kind": "time", "time_ns": t.as_nanos()}),
-        Tov::Range(r) => json!({
-            "kind": "range",
-            "start_ns": r.start.as_nanos(),
-            "end_ns": r.end.as_nanos(),
-        }),
-    }
+    serde_json::to_value(view)
+        .unwrap_or_else(|_| Value::String("metadata serialization failed".to_string()))
 }
 
 fn erased_serialize_to_json(value: &dyn erased_serde::Serialize) -> CuResult<Value> {
@@ -2673,13 +2982,14 @@ fn build_state_root_json<App, P, CB, TF, S, L>(
     time_of: &TF,
 ) -> CuResult<Value>
 where
-    App: CuSimApplication<S, L> + ReflectTaskIntrospection,
+    App: CuSimApplication<S, L> + ReflectTaskIntrospection + CurrentRuntimeCopperList<P>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2697,6 +3007,25 @@ where
         None => Value::Null,
     };
 
+    let replayed_cl = state
+        .session
+        .with_app(|app| {
+            app.current_runtime_copperlist_bytes()
+                .map(|bytes| {
+                    bincode::decode_from_slice::<crate::copperlist::CopperList<P>, _>(
+                        bytes,
+                        bincode::config::standard(),
+                    )
+                    .map(|(cl, _)| cl)
+                    .map_err(|e| {
+                        CuError::new_with_cause("Failed to decode replayed CopperList snapshot", e)
+                    })
+                    .and_then(|cl| copperlist_snapshot::<P>(&cl, time_of, true, true, false))
+                })
+                .transpose()
+        })?
+        .unwrap_or(Value::Null);
+
     let cursor = cursor_snapshot(state, time_of)
         .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
         .unwrap_or(Value::Null);
@@ -2704,6 +3033,7 @@ where
     Ok(json!({
         "tasks": tasks,
         "current_cl": current_cl,
+        "replayed_cl": replayed_cl,
         "cursor": cursor,
     }))
 }
@@ -2714,13 +3044,14 @@ fn state_root_for_query<App, P, CB, TF, S, L>(
     time_of: &TF,
 ) -> CuResult<(Value, Option<ResolvedAt>)>
 where
-    App: CuSimApplication<S, L> + ReflectTaskIntrospection,
+    App: CuSimApplication<S, L> + ReflectTaskIntrospection + CurrentRuntimeCopperList<P>,
     L: UnifiedLogWrite<S> + 'static,
     S: SectionStorage,
-    P: CopperListTuple,
+    P: CopperListTuple + 'static,
     CB: for<'a> Fn(
         &'a crate::copperlist::CopperList<P>,
         RobotClock,
+        RobotClockMock,
     )
         -> Box<dyn for<'z> FnMut(App::Step<'z>) -> crate::simulation::SimOverride + 'a>,
     TF: Fn(&crate::copperlist::CopperList<P>) -> Option<CuTime> + Clone,
@@ -2999,7 +3330,17 @@ where
 {
     let config_str = <App as CuSimApplication<S, L>>::get_original_config();
     let config = read_configuration_str(config_str, None)?;
-    let graph = config.get_graph(None)?;
+    let mission_id = <App as CuSimApplication<S, L>>::mission_id();
+    let graph = config.get_graph(mission_id)?;
+
+    let mut registry = TypeRegistry::default();
+    populate_debug_type_registry::<App>(&mut registry);
+    let mut types: Vec<String> = registry
+        .iter()
+        .map(|registration| registration.type_info().type_path().to_string())
+        .collect();
+    types.sort();
+    types.dedup();
 
     let mut nodes = Vec::new();
     for (node_id, node) in graph.get_all_nodes() {
@@ -3007,17 +3348,25 @@ where
             Flavor::Task => "task",
             Flavor::Bridge => "bridge",
         };
-        let task_type = match crate::curuntime::find_task_type_for_id(graph, node_id) {
+        let task_type = match crate::curuntime::find_task_type_for_id(graph, node_id)? {
             crate::curuntime::CuTaskType::Source => "source",
             crate::curuntime::CuTaskType::Regular => "regular",
             crate::curuntime::CuTaskType::Sink => "sink",
         };
+        let resolved_info = resolve_type_info_by_path(&registry, node.get_type());
+        let state_type_path = resolved_info.map(|info| info.type_path().to_string());
+        let state_fields = resolved_info
+            .map(|info| build_field_catalog(&registry, info, None))
+            .unwrap_or_default();
+
         nodes.push(json!({
             "node_id": node_id,
             "id": node.get_id(),
             "type": node.get_type(),
             "flavor": flavor,
             "task_type": task_type,
+            "state_type_path": state_type_path,
+            "state_fields": state_fields,
         }));
     }
 
@@ -3036,6 +3385,7 @@ where
     let bridges: Vec<Value> = config
         .bridges
         .iter()
+        .filter(|bridge| graph.get_node_id_by_name(bridge.id.as_str()).is_some())
         .map(|bridge| {
             let channels: Vec<Value> = bridge
                 .channels
@@ -3057,16 +3407,8 @@ where
         })
         .collect();
 
-    let mut registry = TypeRegistry::default();
-    <App as ReflectTaskIntrospection>::register_reflect_types(&mut registry);
-    let mut types: Vec<String> = registry
-        .iter()
-        .map(|registration| registration.type_info().type_path().to_string())
-        .collect();
-    types.sort();
-    types.dedup();
-
     Ok(json!({
+        "mission_id": mission_id,
         "tasks": nodes,
         "bridges": bridges,
         "edges": edges,
@@ -3083,6 +3425,562 @@ fn simple_jsonschema_for_type(info: &'static TypeInfo) -> Value {
     })
 }
 
+fn build_output_schema_entries<P>(registry: &TypeRegistry) -> CuResult<Vec<Value>>
+where
+    P: CopperListTuple + 'static,
+{
+    let metadata_fields = build_message_metadata_field_descriptors(registry)?;
+
+    P::get_output_specs()
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let payload_type_path = spec.payload_type_path();
+            let payload_type =
+                resolve_type_info_by_path(registry, payload_type_path).ok_or_else(|| {
+                    CuError::from(format!(
+                        "Payload type '{}' is not registered",
+                        payload_type_path
+                    ))
+                })?;
+            let payload_fields = build_field_catalog(registry, payload_type, Some(spec.task_id));
+            Ok(json!({
+                "index": index,
+                "task_id": spec.task_id,
+                "message_type": spec.msg_type,
+                "payload_type_path": payload_type.type_path(),
+                "payload_fields": payload_fields,
+                "metadata_fields": metadata_fields,
+            }))
+        })
+        .collect()
+}
+
+fn build_message_metadata_field_descriptors(
+    registry: &TypeRegistry,
+) -> CuResult<Vec<DebugFieldDescriptor>> {
+    let metadata_type_path = core::any::type_name::<DebugMessageMetadataView>();
+    let metadata_type =
+        resolve_type_info_by_path(registry, metadata_type_path).ok_or_else(|| {
+            CuError::from(format!(
+                "Message metadata type '{}' is not registered",
+                metadata_type_path
+            ))
+        })?;
+
+    let mut fields = build_field_catalog(registry, metadata_type, None);
+    if let Some(status_txt) = fields
+        .iter_mut()
+        .find(|field| field.display_path == "status_txt")
+    {
+        status_txt.value_type_path = core::any::type_name::<CuCompactString>().to_owned();
+    }
+
+    Ok(fields)
+}
+
+fn build_field_catalog(
+    registry: &TypeRegistry,
+    type_info: &'static TypeInfo,
+    binding_root: Option<&str>,
+) -> Vec<DebugFieldDescriptor> {
+    match type_info {
+        TypeInfo::Struct(info) => struct_children(registry, info, "", binding_root, false),
+        _ => vec![build_type_node(
+            registry,
+            type_info,
+            type_info.type_path(),
+            "",
+            binding_root,
+            false,
+        )],
+    }
+}
+
+fn debug_scalar_field_types() -> &'static HashMap<&'static str, &'static str> {
+    static FIELD_TYPES: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    FIELD_TYPES.get_or_init(|| {
+        let mut types = HashMap::new();
+        for registration in cu29_clock::debug_scalar_registrations() {
+            types.insert(registration.type_path, registration.field_type);
+        }
+        for registration in cu29_units::debug_scalar_registrations() {
+            types.insert(registration.type_path, registration.field_type);
+        }
+        types.insert(core::any::type_name::<CuCompactString>(), "string");
+        types
+    })
+}
+
+fn debug_scalar_field_type(value_type_path: &str) -> Option<&'static str> {
+    debug_scalar_field_types().get(value_type_path).copied()
+}
+
+fn debug_scalar_semantics(value_type_path: &str) -> Option<DebugFieldSemantics> {
+    static FIELD_SEMANTICS: OnceLock<HashMap<&'static str, DebugFieldSemantics>> = OnceLock::new();
+    FIELD_SEMANTICS
+        .get_or_init(|| {
+            let mut semantics = HashMap::new();
+            for registration in cu29_clock::debug_scalar_registrations() {
+                semantics.insert(
+                    registration.type_path,
+                    match registration.kind {
+                        cu29_clock::ClockDebugScalarKind::Time => DebugFieldSemantics::Time,
+                        cu29_clock::ClockDebugScalarKind::OptionalTime => {
+                            DebugFieldSemantics::OptionalTime
+                        }
+                        cu29_clock::ClockDebugScalarKind::Duration => DebugFieldSemantics::Duration,
+                    },
+                );
+            }
+            for registration in cu29_units::debug_scalar_registrations() {
+                semantics.insert(registration.type_path, registration.semantics);
+            }
+            semantics
+        })
+        .get(value_type_path)
+        .cloned()
+}
+
+fn debug_structured_semantics(value_type_path: &str) -> Option<DebugFieldSemantics> {
+    matches!(
+        value_type_path,
+        "cu_spatial_payloads::GeodeticPosition"
+            | "cu_gnss_payloads::GeodeticPosition"
+            | "cu_sensor_payloads::GeodeticPosition"
+    )
+    .then_some(DebugFieldSemantics::GeodeticPosition)
+}
+
+fn debug_type_semantics(value_type_path: &str) -> Option<DebugFieldSemantics> {
+    debug_scalar_semantics(value_type_path).or_else(|| debug_structured_semantics(value_type_path))
+}
+
+fn build_field_node(
+    registry: &TypeRegistry,
+    type_info: Option<&'static TypeInfo>,
+    fallback_type: &Type,
+    display_path: &str,
+    binding_name: Option<&str>,
+    nullable: bool,
+) -> DebugFieldDescriptor {
+    let Some(type_info) = type_info else {
+        let value_type_path = fallback_type.path();
+        return debug_field_descriptor(
+            display_path,
+            binding_name,
+            primitive_field_type_name(value_type_path).unwrap_or("unknown"),
+            value_type_path,
+            DebugFieldShape {
+                semantics: None,
+                nullable,
+                kind: DebugFieldKind::Scalar,
+            },
+            Vec::new(),
+        );
+    };
+
+    build_type_node(
+        registry,
+        type_info,
+        type_info.type_path(),
+        display_path,
+        binding_name,
+        nullable,
+    )
+}
+
+fn build_type_node(
+    registry: &TypeRegistry,
+    type_info: &'static TypeInfo,
+    value_type_path: &str,
+    display_path: &str,
+    binding_name: Option<&str>,
+    nullable: bool,
+) -> DebugFieldDescriptor {
+    if let Some(field_type) = debug_scalar_field_type(value_type_path) {
+        return debug_field_descriptor(
+            display_path,
+            binding_name,
+            field_type,
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Scalar,
+            },
+            Vec::new(),
+        );
+    }
+
+    match type_info {
+        TypeInfo::Struct(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "object",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Struct,
+            },
+            struct_children(registry, info, display_path, binding_name, nullable),
+        ),
+        TypeInfo::TupleStruct(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "tuple",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::TupleStruct,
+            },
+            tuple_struct_children(registry, info, display_path, binding_name, nullable),
+        ),
+        TypeInfo::Tuple(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "tuple",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Tuple,
+            },
+            tuple_children(registry, info, display_path, binding_name, nullable),
+        ),
+        TypeInfo::List(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "array",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::List,
+            },
+            indexed_children(
+                registry,
+                info.item_info(),
+                &info.item_ty(),
+                display_path,
+                binding_name,
+                nullable,
+            ),
+        ),
+        TypeInfo::Array(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "array",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Array,
+            },
+            indexed_children(
+                registry,
+                info.item_info(),
+                &info.item_ty(),
+                display_path,
+                binding_name,
+                nullable,
+            ),
+        ),
+        TypeInfo::Map(_) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "object",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Map,
+            },
+            Vec::new(),
+        ),
+        TypeInfo::Set(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            "array",
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Set,
+            },
+            indexed_children(
+                registry,
+                registry.get_type_info(info.value_ty().id()),
+                &info.value_ty(),
+                display_path,
+                binding_name,
+                nullable,
+            ),
+        ),
+        TypeInfo::Enum(info) => {
+            if let Some((inner_info, inner_type)) = option_inner_field(info) {
+                return build_field_node(
+                    registry,
+                    inner_info,
+                    inner_type,
+                    display_path,
+                    binding_name,
+                    true,
+                );
+            }
+
+            debug_field_descriptor(
+                display_path,
+                binding_name,
+                "enum",
+                value_type_path,
+                DebugFieldShape {
+                    semantics: debug_type_semantics(value_type_path),
+                    nullable,
+                    kind: DebugFieldKind::Enum,
+                },
+                Vec::new(),
+            )
+        }
+        TypeInfo::Opaque(info) => debug_field_descriptor(
+            display_path,
+            binding_name,
+            primitive_field_type_name(info.type_path()).unwrap_or("unknown"),
+            value_type_path,
+            DebugFieldShape {
+                semantics: debug_type_semantics(value_type_path),
+                nullable,
+                kind: DebugFieldKind::Scalar,
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn struct_children(
+    registry: &TypeRegistry,
+    info: &StructInfo,
+    display_path: &str,
+    binding_name: Option<&str>,
+    nullable: bool,
+) -> Vec<DebugFieldDescriptor> {
+    let skipped = skipped_indices(registry, info.type_id());
+    info.iter()
+        .enumerate()
+        .filter(|(index, _)| !skipped.contains(index))
+        .map(|(_, field)| {
+            let next_display = join_field_path(display_path, field.name());
+            let next_binding = binding_name.map(|current| join_field_path(current, field.name()));
+            build_field_node(
+                registry,
+                field.type_info(),
+                field.ty(),
+                &next_display,
+                next_binding.as_deref(),
+                nullable,
+            )
+        })
+        .collect()
+}
+
+fn tuple_struct_children(
+    registry: &TypeRegistry,
+    info: &TupleStructInfo,
+    display_path: &str,
+    binding_name: Option<&str>,
+    nullable: bool,
+) -> Vec<DebugFieldDescriptor> {
+    let skipped = skipped_indices(registry, info.type_id());
+    info.iter()
+        .enumerate()
+        .filter(|(index, _)| !skipped.contains(index))
+        .map(|(index, field)| {
+            let next_display = indexed_path(display_path, Some(index));
+            let next_binding = binding_name.map(|current| indexed_path(current, Some(index)));
+            build_field_node(
+                registry,
+                field.type_info(),
+                field.ty(),
+                &next_display,
+                next_binding.as_deref(),
+                nullable,
+            )
+        })
+        .collect()
+}
+
+fn tuple_children(
+    registry: &TypeRegistry,
+    info: &TupleInfo,
+    display_path: &str,
+    binding_name: Option<&str>,
+    nullable: bool,
+) -> Vec<DebugFieldDescriptor> {
+    info.iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let next_display = indexed_path(display_path, Some(index));
+            let next_binding = binding_name.map(|current| indexed_path(current, Some(index)));
+            build_field_node(
+                registry,
+                field.type_info(),
+                field.ty(),
+                &next_display,
+                next_binding.as_deref(),
+                nullable,
+            )
+        })
+        .collect()
+}
+
+fn indexed_children(
+    registry: &TypeRegistry,
+    item_info: Option<&'static TypeInfo>,
+    item_type: &Type,
+    display_path: &str,
+    binding_name: Option<&str>,
+    nullable: bool,
+) -> Vec<DebugFieldDescriptor> {
+    let next_display = indexed_path(display_path, None);
+    let next_binding = binding_name.map(|current| indexed_path(current, None));
+    vec![build_field_node(
+        registry,
+        item_info,
+        item_type,
+        &next_display,
+        next_binding.as_deref(),
+        nullable,
+    )]
+}
+
+fn skipped_indices(registry: &TypeRegistry, type_id: core::any::TypeId) -> BTreeSet<usize> {
+    registry
+        .get_type_data::<SerializationData>(type_id)
+        .map(|data| data.iter_skipped().map(|(index, _)| *index).collect())
+        .unwrap_or_default()
+}
+
+fn resolve_type_info_by_path(
+    registry: &TypeRegistry,
+    type_path: &str,
+) -> Option<&'static TypeInfo> {
+    registry
+        .get_with_type_path(type_path)
+        .map(|registration| registration.type_info())
+        .or_else(|| {
+            registry.iter().find_map(|registration| {
+                let registered = registration.type_info().type_path();
+                (registered.ends_with(type_path) || type_path.ends_with(registered))
+                    .then_some(registration.type_info())
+            })
+        })
+}
+
+fn option_inner_field(info: &EnumInfo) -> Option<(Option<&'static TypeInfo>, &Type)> {
+    let none_variant = info.variant("None")?;
+    let some_variant = info.variant("Some")?;
+
+    if !matches!(none_variant, VariantInfo::Unit(_)) {
+        return None;
+    }
+
+    let VariantInfo::Tuple(tuple_variant) = some_variant else {
+        return None;
+    };
+    if tuple_variant.field_len() != 1 {
+        return None;
+    }
+
+    let field = tuple_variant.field_at(0)?;
+    Some((field.type_info(), field.ty()))
+}
+
+struct DebugFieldShape {
+    semantics: Option<DebugFieldSemantics>,
+    nullable: bool,
+    kind: DebugFieldKind,
+}
+
+fn debug_field_descriptor(
+    display_path: &str,
+    binding_name: Option<&str>,
+    field_type: &str,
+    value_type_path: &str,
+    shape: DebugFieldShape,
+    children: Vec<DebugFieldDescriptor>,
+) -> DebugFieldDescriptor {
+    DebugFieldDescriptor {
+        display_path: display_path.to_owned(),
+        binding_name: binding_name.map(str::to_owned),
+        field_type: field_type.to_owned(),
+        value_type_path: value_type_path.to_owned(),
+        semantics: shape.semantics,
+        nullable: shape.nullable,
+        kind: shape.kind,
+        children,
+    }
+}
+
+fn join_field_path(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.to_owned()
+    } else {
+        format!("{prefix}.{field}")
+    }
+}
+
+fn indexed_path(prefix: &str, index: Option<usize>) -> String {
+    let base = path_or_value(prefix);
+    match index {
+        Some(index) => format!("{base}[{index}]"),
+        None => format!("{base}[]"),
+    }
+}
+
+fn path_or_value(path: &str) -> String {
+    if path.is_empty() {
+        "value".to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn primitive_field_type_name(type_path: &str) -> Option<&'static str> {
+    match type_path {
+        "()" => Some("null"),
+        "bool" | "core::primitive::bool" => Some("bool"),
+        "i8"
+        | "core::primitive::i8"
+        | "i16"
+        | "core::primitive::i16"
+        | "i32"
+        | "core::primitive::i32"
+        | "i64"
+        | "core::primitive::i64"
+        | "i128"
+        | "core::primitive::i128"
+        | "isize"
+        | "core::primitive::isize"
+        | "u8"
+        | "core::primitive::u8"
+        | "u16"
+        | "core::primitive::u16"
+        | "u32"
+        | "core::primitive::u32"
+        | "u64"
+        | "core::primitive::u64"
+        | "u128"
+        | "core::primitive::u128"
+        | "usize"
+        | "core::primitive::usize" => Some("integer"),
+        "f32" | "core::primitive::f32" | "f64" | "core::primitive::f64" => Some("number"),
+        "char" | "core::primitive::char" => Some("string"),
+        "alloc::string::String" | "std::string::String" | "str" | "&str" => Some("string"),
+        _ => None,
+    }
+}
 #[cfg(feature = "reflect")]
 fn reflect_value_to_json(value: &dyn crate::reflect::Reflect) -> Value {
     let mut registry = TypeRegistry::default();
@@ -3146,5 +4044,312 @@ fn hex_digit(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
         _ => (b'a' + (n - 10)) as char,
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::{
+        build_message_metadata_field_descriptors, build_output_schema_entries, build_stack_schema,
+        metadata_to_json, register_debug_support_types,
+    };
+    use crate::app::CuSimApplication;
+    use crate::curuntime::KeyFrame;
+    use crate::cutask::CuMsgMetadata;
+    use crate::reflect::{Reflect, ReflectTaskIntrospection, TypePath, TypeRegistry};
+    use crate::simulation::SimOverride;
+    use compact_str::CompactString;
+    use cu29_clock::{CuTime, CuTimeRange, OptionCuTime, PartialCuTimeRange, Tov};
+    use cu29_traits::{
+        CuCompactString, CuMsgOrigin, CuResult, DebugFieldKind, ErasedCuStampedData,
+        ErasedCuStampedDataSet, MatchingTasks, TaskOutputSpec,
+    };
+    use cu29_unifiedlog::memmap::{MmapSectionStorage, MmapUnifiedLoggerWrite};
+    use cu29_units::si::f32::Ratio;
+    struct MissionStackApp;
+
+    #[derive(Reflect, bincode::Encode, bincode::Decode, serde::Serialize, Default, Debug)]
+    struct CanonicalPayload {
+        reading: u16,
+    }
+
+    type PayloadAlias = CanonicalPayload;
+
+    #[derive(bincode::Encode, bincode::Decode, serde::Serialize, Default, Debug)]
+    struct AliasPayloadCopperList;
+
+    impl ErasedCuStampedDataSet for AliasPayloadCopperList {
+        fn cumsgs(&self) -> Vec<&dyn ErasedCuStampedData> {
+            Vec::new()
+        }
+    }
+
+    impl MatchingTasks for AliasPayloadCopperList {
+        fn get_all_task_ids() -> &'static [&'static str] {
+            &["alias_task"]
+        }
+
+        fn get_output_specs() -> &'static [TaskOutputSpec] {
+            &[TaskOutputSpec {
+                task_id: "alias_task",
+                msg_type: "alias::payload",
+                payload_type_path_fn: <PayloadAlias as TypePath>::type_path,
+            }]
+        }
+    }
+
+    impl ReflectTaskIntrospection for MissionStackApp {
+        fn reflect_task(&self, _task_id: &str) -> Option<&dyn Reflect> {
+            None
+        }
+
+        fn reflect_task_mut(&mut self, _task_id: &str) -> Option<&mut dyn Reflect> {
+            None
+        }
+    }
+
+    impl CuSimApplication<MmapSectionStorage, MmapUnifiedLoggerWrite> for MissionStackApp {
+        type Step<'z> = ();
+
+        fn get_original_config() -> String {
+            include_str!("../tests/remote_debug_missions_config.ron").to_string()
+        }
+
+        fn mission_id() -> Option<&'static str> {
+            Some("Beta")
+        }
+
+        fn start_all_tasks(
+            &mut self,
+            _sim_callback: &mut impl for<'z> FnMut(Self::Step<'z>) -> SimOverride,
+        ) -> CuResult<()> {
+            Ok(())
+        }
+
+        fn run_one_iteration(
+            &mut self,
+            _sim_callback: &mut impl for<'z> FnMut(Self::Step<'z>) -> SimOverride,
+        ) -> CuResult<()> {
+            Ok(())
+        }
+
+        fn run(
+            &mut self,
+            _sim_callback: &mut impl for<'z> FnMut(Self::Step<'z>) -> SimOverride,
+        ) -> CuResult<()> {
+            Ok(())
+        }
+
+        fn stop_all_tasks(
+            &mut self,
+            _sim_callback: &mut impl for<'z> FnMut(Self::Step<'z>) -> SimOverride,
+        ) -> CuResult<()> {
+            Ok(())
+        }
+
+        fn restore_keyframe(&mut self, _freezer: &KeyFrame) -> CuResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stack_schema_uses_generated_mission_id() -> CuResult<()> {
+        let mission_id = <MissionStackApp as CuSimApplication<
+            MmapSectionStorage,
+            MmapUnifiedLoggerWrite,
+        >>::mission_id();
+        assert_eq!(mission_id, Some("Beta"));
+
+        let schema =
+            build_stack_schema::<MissionStackApp, MmapSectionStorage, MmapUnifiedLoggerWrite>()?;
+        assert_eq!(schema.get("mission_id"), Some(&serde_json::json!("Beta")));
+
+        let mut task_ids: Vec<&str> = schema["tasks"]
+            .as_array()
+            .expect("tasks array")
+            .iter()
+            .filter_map(|task| task["id"].as_str())
+            .collect();
+        task_ids.sort_unstable();
+        assert_eq!(task_ids, vec!["beta_bridge", "beta_sink", "beta_src"]);
+
+        let mut bridge_ids: Vec<&str> = schema["bridges"]
+            .as_array()
+            .expect("bridges array")
+            .iter()
+            .filter_map(|bridge| bridge["id"].as_str())
+            .collect();
+        bridge_ids.sort_unstable();
+        assert_eq!(bridge_ids, vec!["beta_bridge"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn output_schema_resolves_alias_payload_types_via_canonical_type_path() -> CuResult<()> {
+        let mut registry = TypeRegistry::default();
+        registry.register::<PayloadAlias>();
+        register_debug_support_types(&mut registry);
+
+        let outputs = build_output_schema_entries::<AliasPayloadCopperList>(&registry)?;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0]["payload_type_path"].as_str(),
+            Some(<PayloadAlias as TypePath>::type_path())
+        );
+        assert!(
+            outputs[0]["payload_fields"]
+                .as_array()
+                .expect("payload_fields array")
+                .iter()
+                .any(|field| field["display_path"].as_str() == Some("reading"))
+        );
+
+        Ok(())
+    }
+
+    #[derive(Reflect)]
+    struct QuantityPayload {
+        power: Ratio,
+    }
+
+    #[test]
+    fn output_schema_collapses_registered_scalar_wrappers() {
+        let mut registry = TypeRegistry::default();
+        registry.register::<QuantityPayload>();
+        registry.register::<Ratio>();
+        register_debug_support_types(&mut registry);
+
+        let info = registry
+            .get_with_type_path(<QuantityPayload as TypePath>::type_path())
+            .expect("quantity payload registered")
+            .type_info();
+        let fields = super::build_field_catalog(&registry, info, None);
+
+        assert!(fields.iter().any(|field| {
+            field.display_path == "power"
+                && field.field_type == "number"
+                && field.value_type_path == <Ratio as TypePath>::type_path()
+        }));
+        assert!(
+            !fields
+                .iter()
+                .any(|field| field.display_path == "power.value")
+        );
+    }
+
+    #[test]
+    fn metadata_schema_uses_actual_type_paths() -> CuResult<()> {
+        let mut registry = TypeRegistry::default();
+        register_debug_support_types(&mut registry);
+
+        let fields = build_message_metadata_field_descriptors(&registry)?;
+        let tov = fields
+            .iter()
+            .find(|field| field.display_path == "tov")
+            .expect("tov field");
+        assert_eq!(tov.kind, DebugFieldKind::Enum);
+        assert_eq!(tov.value_type_path, core::any::type_name::<Tov>());
+
+        let process_time = fields
+            .iter()
+            .find(|field| field.display_path == "process_time")
+            .expect("process_time field");
+        assert_eq!(process_time.kind, DebugFieldKind::Struct);
+        assert_eq!(
+            process_time.value_type_path,
+            core::any::type_name::<PartialCuTimeRange>()
+        );
+        assert!(process_time.children.iter().any(|child| {
+            child.display_path == "process_time.start"
+                && child.value_type_path == core::any::type_name::<OptionCuTime>()
+        }));
+
+        let status_txt = fields
+            .iter()
+            .find(|field| field.display_path == "status_txt")
+            .expect("status_txt field");
+        assert_eq!(status_txt.kind, DebugFieldKind::Scalar);
+        assert_eq!(
+            status_txt.value_type_path,
+            core::any::type_name::<CuCompactString>()
+        );
+
+        let origin = fields
+            .iter()
+            .find(|field| field.display_path == "origin")
+            .expect("origin field");
+        assert_eq!(origin.kind, DebugFieldKind::Struct);
+        assert_eq!(
+            origin.value_type_path,
+            core::any::type_name::<CuMsgOrigin>()
+        );
+        assert!(origin.nullable);
+
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_json_uses_actual_rust_shapes() {
+        let metadata = CuMsgMetadata {
+            process_time: PartialCuTimeRange {
+                start: OptionCuTime::from(Some(CuTime::from(10u64))),
+                end: OptionCuTime::none(),
+            },
+            status_txt: CuCompactString(CompactString::from("ready")),
+            origin: Some(CuMsgOrigin {
+                subsystem_code: 7,
+                instance_id: 11,
+                cl_id: 42,
+            }),
+        };
+
+        let value = metadata_to_json(
+            &metadata,
+            Tov::Range(CuTimeRange {
+                start: CuTime::from(100u64),
+                end: CuTime::from(200u64),
+            }),
+        );
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "tov": {
+                    "Range": {
+                        "start": 100u64,
+                        "end": 200u64,
+                    }
+                },
+                "process_time": {
+                    "start": 10u64,
+                    "end": OptionCuTime::NONE_SENTINEL_NANOS,
+                },
+                "status_txt": "ready",
+                "origin": {
+                    "subsystem_code": 7,
+                    "instance_id": 11,
+                    "cl_id": 42,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_debug_schema_supports_compact_status_strings() {
+        let mut paths = Vec::new();
+        super::append_builtin_debug_type_paths(&mut paths);
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == core::any::type_name::<CuCompactString>())
+        );
+
+        let schema = super::builtin_debug_type_schema(
+            core::any::type_name::<CuCompactString>(),
+            "jsonschema",
+        )
+        .expect("CuCompactString builtin schema");
+        assert_eq!(schema["type"], "string");
     }
 }

@@ -4,6 +4,7 @@ description = "Demonstrates CuDebug time-travel API on recorded Copper logs"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -14,7 +15,6 @@ publish = false
 
 [dependencies]
 cu29 = { workspace = true, features = ["reflect"] }
-cu29-helpers = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 

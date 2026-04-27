@@ -4,14 +4,21 @@ description = "Rust library for controlling the SN754410 motor driver on the Ras
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[package.metadata.copper]
+kind = "sink"
+domains = ["actuator/motor-driver"]
+environments = ["host"]
+host_os = ["linux"]
+
 [dependencies]
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false, features = [
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false, features = [
   "std",
   "textlogs",
   "units",
@@ -21,7 +28,6 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-cu29-helpers = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { workspace = true, default-features = false, features = ["hal"] }

@@ -4,11 +4,17 @@ description = "This is a driver for the Velodyne VLP-16 for the Copper engine."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 homepage.workspace = true
 repository.workspace = true
+
+[package.metadata.copper]
+kind = "source"
+domains = ["sensor/lidar"]
+environments = ["host"]
 
 [dependencies]
 cu29 = { workspace = true }
@@ -17,4 +23,4 @@ velodyne-lidar = { version = "0.3.0", features = ["pcap", "parallel"] }
 # remove `nmea` for `velodyne-lidar` since it has conflicts for `dep:serde_with` with `dep:zenoh-config`
 
 [dev-dependencies]
-cu-udp-inject = { path = "../../testing/cu_udp_inject", version = "0.13.0" }
+cu-udp-inject = { path = "../../testing/cu_udp_inject", version = "0.15.0" }

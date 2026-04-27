@@ -9,6 +9,12 @@ NED = "NED"
 arange = "arange"
 mmaped = "mmaped"
 consts = "consts"
+Paeth = "Paeth"
+ser = "ser"
 
 [files]
-extend-exclude = ["patches/*", "components/payloads/cu_ros2_payloads/**"]
+extend-exclude = [
+  "patches/*",
+  "components/payloads/cu_ros2_payloads/**",
+  "components/libs/zed_sdk_sys/vendor/**",
+]
