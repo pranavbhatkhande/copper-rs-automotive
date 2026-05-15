@@ -5,7 +5,7 @@ MSRV := "1.95.0"
 PUBLIC_API_VERSION := "0.51.0"
 PUBLIC_API_TOOLCHAIN := "nightly"
 export ROOT := `git rev-parse --show-toplevel`
-EMBEDDED_EXCLUDES := shell('python3 $1/support/ci/embedded_crates.py excludes', ROOT)
+EMBEDDED_EXCLUDES := shell('python3 $1/support/ci/embedded_crates.py excludes --toolchain stable', ROOT)
 PREK_FMT_FIX_HOOKS := "trailing-whitespace mixed-line-ending"
 PREK_FMT_CHECK_HOOKS := "trailing-whitespace check-merge-conflict detect-private-key check-case-conflict check-added-large-files check-yaml check-json check-xml check-symlinks mixed-line-ending"
 
@@ -31,8 +31,7 @@ lint:
 fmt-check: check-format-tools
 	@cargo +stable fmt --all -- --check
 	@git ls-files -z '*.toml' | xargs -0 -r env RUST_LOG=warn taplo format --check
-	@bash -lc 'set -euo pipefail; changed=(); while IFS= read -r -d "" f; do tmp=$(mktemp); cp "$f" "$tmp"; fmtron --input "$tmp" >/dev/null; if ! cmp -s "$f" "$tmp"; then changed+=("$f"); fi; rm -f "$tmp"; done < <(git ls-files -z "*.ron" ":!examples/modular_config_example/motors.ron"); if ((${#changed[@]})); then printf "RON formatting check failed:\n"; printf "%s\n" "${changed[@]}"; exit 1; fi'
-	@rg --files -g '*.ron.bak' | xargs rm -f
+	@bash support/ci/check_ron_format.sh
 	@prek run --all-files {{PREK_FMT_CHECK_HOOKS}}
 
 # Apply formatting plus auto-fixable CI hygiene hooks
@@ -40,7 +39,7 @@ fmt: check-format-tools
 	@cargo +stable fmt --all
 	@git ls-files -z '*.toml' | xargs -0 -r env RUST_LOG=warn taplo format >/dev/null
 	@git ls-files -z '*.ron' ':!examples/modular_config_example/motors.ron' | xargs -0 -r -n 1 fmtron --input>/dev/null
-	@rg --files -g '*.ron.bak' | xargs rm -f
+	@find . -type f -name '*.ron.bak' -delete
 	@bash -lc 'set -euo pipefail; prek run --all-files {{PREK_FMT_FIX_HOOKS}} || prek run --all-files {{PREK_FMT_FIX_HOOKS}}'
 
 # Ensure the tools needed by fmt/fmt-check are installed.
@@ -59,10 +58,6 @@ check-format-tools:
 	fi
 	if ! command -v prek >/dev/null 2>&1; then
 		echo "Missing prek. Install with: cargo install --locked prek"
-		missing=1
-	fi
-	if ! command -v rg > /dev/null 2>&1; then
-		echo "Missing rg. Install with: cargo install --locked rg"
 		missing=1
 	fi
 	if [[ "$missing" -ne 0 ]]; then
@@ -125,7 +120,7 @@ host_target := `rustc +stable -vV | sed -n 's/host: //p'`
 # no_std/embedded clippy checks mirroring the embedded workflow.
 clippy-nostd:
 	cargo +stable clippy --no-default-features
-	python3 support/ci/embedded_crates.py run --action clippy
+	python3 support/ci/embedded_crates.py run --action clippy --toolchain stable
 	cd examples/cu_rp2350_skeleton && cargo +stable clippy --target thumbv8m.main-none-eabihf --bin cu-blinky --features firmware
 	cd examples/cu_rp2350_skeleton && cargo +stable clippy --no-default-features --features host --bins --target={{host_target}}
 
@@ -136,6 +131,32 @@ test:
 
 	cargo +stable nextest run --all-targets --workspace {{EMBEDDED_EXCLUDES}}
 	cargo +stable nextest run --no-default-features
+
+# Ensure the tools needed by coverage are installed.
+check-coverage-tools:
+	#!/usr/bin/env bash
+	set -euo pipefail
+
+	missing=0
+	if ! cargo +stable llvm-cov --version >/dev/null 2>&1; then
+		echo "Missing cargo-llvm-cov. Install with: cargo install --locked cargo-llvm-cov"
+		missing=1
+	fi
+	if ! cargo +stable nextest --version >/dev/null 2>&1; then
+		echo "Missing cargo-nextest. Install with: cargo install --locked cargo-nextest"
+		missing=1
+	fi
+	if ! rustup component list --toolchain stable | grep -Eq '^llvm-tools(-preview|-.*-unknown-.*)? .*installed'; then
+		echo "Missing llvm-tools-preview for stable. Install with: rustup component add llvm-tools-preview --toolchain stable"
+		missing=1
+	fi
+	if [[ "$missing" -ne 0 ]]; then
+		exit 1
+	fi
+
+# Generate the Linux std coverage report used by CI.
+coverage: check-coverage-tools
+	support/ci/run_coverage.sh
 
 # Verify the declared minimum supported Rust version.
 msrv-check:
@@ -151,8 +172,8 @@ nostd-ci:
 	just typos
 	cargo +stable build --no-default-features
 	cargo +stable nextest run --no-default-features
-	python3 support/ci/embedded_crates.py run --action clippy
-	python3 support/ci/embedded_crates.py run --action build
+	python3 support/ci/embedded_crates.py run --action clippy --toolchain stable
+	python3 support/ci/embedded_crates.py run --action build --toolchain stable
 	cd examples/cu_rp2350_skeleton && cargo +stable clippy --target thumbv8m.main-none-eabihf --bin cu-blinky --features firmware
 	cd examples/cu_rp2350_skeleton && cargo +stable clippy --no-default-features --features host --bins --target={{host_target}}
 	cd examples/cu_rp2350_skeleton && cargo +stable build-arm
@@ -201,21 +222,15 @@ std-ci mode="debug":
 		-- determinism_record_and_resim --test-threads=1
 
 	if [[ "$mode" == "debug" ]]; then
-		if ! cargo +stable generate --version >/dev/null 2>&1; then
-			cargo +stable install cargo-generate
-		fi
+		rm -rf support/cargo_cunew/templates/test_project support/cargo_cunew/templates/test_workspace
+		cargo +stable run -p cargo-cunew -- support/cargo_cunew/templates/test_project --template project --source local --copper-root .
+		cargo +stable run -p cargo-cunew -- support/cargo_cunew/templates/test_workspace --template workspace --source local --copper-root .
 		(
-			cd templates
-			rm -rf test_project test_workspace
-			cargo +stable generate -p cu_project --name test_project --destination . -d copper_source=local -d copper_root_path=../.. --silent
-			cargo +stable generate -p cu_full --name test_workspace --destination . -d copper_source=local -d copper_root_path=../.. --silent
-		)
-		(
-			cd templates/test_project
+			cd support/cargo_cunew/templates/test_project
 			cargo +stable build
 		)
 		(
-			cd templates/test_workspace
+			cd support/cargo_cunew/templates/test_workspace
 			cargo +stable build
 		)
 	fi

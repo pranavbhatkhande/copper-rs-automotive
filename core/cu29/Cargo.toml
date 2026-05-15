@@ -13,6 +13,15 @@ homepage.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+[[test]]
+name = "safety_ids"
+path = "tests/safety_ids.rs"
+harness = false
+required-features = ["safety-ids"]
+
+[package.metadata.copper-safety]
+scope = "bare-metal-no-std"
+
 [dependencies]
 cu29-clock = { workspace = true }
 cu29-derive = { workspace = true }
@@ -22,7 +31,7 @@ cu29-log-runtime = { workspace = true }
 cu29-reflect-derive = { workspace = true }
 cu29-runtime = { workspace = true }
 cu29-traits = { workspace = true }
-cu29-units = { path = "../cu29_units", version = "0.15.0", default-features = false, optional = true }
+cu29-units = { path = "../cu29_units", version = "1.0.0-rc2", default-features = false, optional = true }
 cu29-unifiedlog = { workspace = true }
 cu29-value = { workspace = true }
 defmt = { workspace = true, optional = true }
@@ -32,6 +41,8 @@ bevy_reflect_derive = { workspace = true, optional = true }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
+inventory = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true, default-features = true }
 
 # only std
 rayon = { workspace = true, optional = true }
@@ -49,7 +60,6 @@ defmt = [
 textlogs = ["cu29-log-derive/textlogs"]
 units = ["dep:cu29-units"]
 macro_debug = ["cu29-derive/macro_debug", "cu29-log-derive/macro_debug"]
-logviz = ["cu29-derive/logviz"]
 signal-handler = ["dep:ctrlc", "cu29-derive/signal-handler"]
 sysclock-perf = ["std", "cu29-runtime/sysclock-perf"]
 high-precision-limiter = ["std", "cu29-runtime/high-precision-limiter"]
@@ -83,3 +93,4 @@ std = [
   "cu29-value/std",
 ]
 rtsan = ["dep:rtsan-standalone", "cu29-derive/rtsan"]
+safety-ids = ["std", "dep:inventory", "dep:serde_json"]

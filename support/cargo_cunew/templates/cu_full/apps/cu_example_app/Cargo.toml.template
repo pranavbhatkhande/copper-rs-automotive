@@ -1,0 +1,31 @@
+[package]
+name = "cu_example_app"
+version = "0.1.0"
+edition = "2024"
+default-run = "cu_example_app"
+
+# The main executable of your application
+[[bin]]
+name = "cu_example_app"
+path = "src/main.rs"
+
+[[bin]]
+name = "cu_example_app-logreader"
+path = "src/logreader.rs"
+required-features = ["logreader"]
+
+[[bin]]
+name = "cu_example_app-resim"
+path = "src/resim.rs"
+required-features = ["sim-debug"]
+
+[features]
+default = []
+logreader = ["dep:cu29-export"]
+sim-debug = ["logreader", "cu29/reflect", "cu29/remote-debug"]
+
+[dependencies]
+cu29 = { workspace = true }
+cu29-export = { workspace = true, optional = true }
+bincode = { workspace = true }
+serde = { workspace = true }
