@@ -110,8 +110,10 @@ members = [
   "examples/cu_can_example",
   "examples/cu_uds_example",
   "examples/cu_someip_example",
-  "examples/cu_vehicle_sim",
-  "examples/cu_automotive_determinism_test",
+   "examples/cu_vehicle_sim",
+   "examples/cu_automotive_determinism_test",
+   "examples/ecu_interaction",
+
 ]
 
 # put only the core crates here that are not platform specific

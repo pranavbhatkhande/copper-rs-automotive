@@ -1,0 +1,26 @@
+// ECU Interaction Task Graph
+(
+    tasks: [
+        (
+            id: "body",
+            type: "tasks::BodyEcu",
+        ),
+        (
+            id: "meter",
+            type: "tasks::MeterEcu",
+        ),
+    ],
+    cnx: [
+        (
+            src: "body",
+            dst: "meter",
+            msg: "cu_automotive_payloads::can::CanFrame",
+        ),
+        (
+            src: "meter",
+            dst: "body",
+            msg: "cu_automotive_payloads::can::CanFrame",
+        ),
+    ],
+)
+

@@ -13,8 +13,8 @@ repository.workspace = true
 
 [dependencies]
 bincode = { workspace = true }
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false }
-cu29-clock = { path = "../../../core/cu29_clock", version = "0.13.0", default-features = false }
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false }
+cu29-clock = { path = "../../../core/cu29_clock", version = "0.15.0", default-features = false }
 serde = { workspace = true }
 serde-big-array = { version = "0.5", default-features = false }
 

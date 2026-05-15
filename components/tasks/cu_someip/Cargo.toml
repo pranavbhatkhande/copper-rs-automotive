@@ -11,8 +11,8 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-cu29 = { path = "../../../core/cu29", version = "0.13.0", default-features = false }
-cu-automotive-payloads = { path = "../../payloads/cu_automotive_payloads", version = "0.13.0", default-features = false }
+cu29 = { path = "../../../core/cu29", version = "0.15.0", default-features = false }
+cu-automotive-payloads = { path = "../../payloads/cu_automotive_payloads", version = "0.15.0", default-features = false }
 bincode = { workspace = true }
 serde = { workspace = true }
 

@@ -1,6 +1,6 @@
 [package]
-name = "cu-can-example"
-description = "CAN bus example using Copper automotive stack — mock source → filter → sink pipeline."
+name = "cu-ecu-interaction"
+description = "Simulates communication between a Body ECU and a Meter ECU over CAN."
 publish = false
 
 version.workspace = true
@@ -13,15 +13,17 @@ homepage.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cu-can-example"
+name = "cu-ecu-interaction"
 path = "src/main.rs"
 
 [dependencies]
 cu29 = { workspace = true }
 cu29-helpers = { workspace = true }
 cu-automotive-payloads = { workspace = true }
-cu-can = { path = "../../components/tasks/cu_can", version = "0.15.0", features = ["mock"] }
 serde = { workspace = true }
 
+[dev-dependencies]
+cu-automotive-payloads = { workspace = true }
+
 [package.metadata.cargo-shear]
-ignored = ["serde", "cu-can", "cu-automotive-payloads"]
+ignored = ["serde", "cu-automotive-payloads"]

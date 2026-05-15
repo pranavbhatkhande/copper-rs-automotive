@@ -19,8 +19,8 @@ path = "src/main.rs"
 [dependencies]
 cu29 = { workspace = true }
 cu29-helpers = { workspace = true }
-cu-automotive-payloads = { path = "../../components/payloads/cu_automotive_payloads", version = "0.13.0" }
-cu-someip = { path = "../../components/tasks/cu_someip", version = "0.13.0", features = ["mock"] }
+cu-automotive-payloads = { workspace = true }
+cu-someip = { path = "../../components/tasks/cu_someip", version = "0.15.0", features = ["mock"] }
 serde = { workspace = true }
 
 [package.metadata.cargo-shear]

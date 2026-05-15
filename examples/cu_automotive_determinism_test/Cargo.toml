@@ -18,8 +18,8 @@ cu29 = { workspace = true }
 cu29-helpers = { workspace = true }
 cu29-export = { workspace = true }
 cu29-unifiedlog = { workspace = true }
-cu-uds = { path = "../../components/tasks/cu_uds", version = "0.13.0" }
-cu-automotive-payloads = { path = "../../components/payloads/cu_automotive_payloads", version = "0.13.0" }
+cu-uds = { path = "../../components/tasks/cu_uds", version = "0.15.0" }
+cu-automotive-payloads = { workspace = true }
 serde = { workspace = true }
 
 [package.metadata.cargo-shear]
