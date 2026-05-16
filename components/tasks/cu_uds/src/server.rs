@@ -156,7 +156,7 @@ impl UdsServer {
 
     fn handle_ecu_reset(&mut self, sub: u8, suppress: bool) -> Option<IsotpPdu> {
         match sub {
-            0x01 | 0x02 | 0x03 => {
+            0x01..=0x03 => {
                 self.reset_session();
                 if suppress {
                     None
@@ -427,17 +427,16 @@ impl CuTask for UdsServer {
         // S3 timeout: reset to Default session if idle too long
         if self.session_type != UdsSessionType::Default
             && self.last_request_time.0 > 0
-            && now.saturating_sub(self.last_request_time) > self.session_timeout
+            && CuDuration::from(now.saturating_sub(self.last_request_time)) > self.session_timeout
         {
             self.reset_session();
         }
 
-        if let Some(pdu) = input.payload() {
-            if let Some(resp_pdu) = self.handle(pdu, now) {
+        if let Some(pdu) = input.payload()
+            && let Some(resp_pdu) = self.handle(pdu, now) {
                 output.set_payload(resp_pdu);
                 output.tov = Tov::Time(now);
             }
-        }
         Ok(())
     }
 }

@@ -12,6 +12,7 @@ const MAX_SERVICES: usize = 32;
 
 /// A registered service handler entry.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 struct ServiceEntry {
     service_id: u16,
     #[allow(dead_code)]
@@ -49,8 +50,8 @@ impl CuTask for SomeIpRouter {
             core::array::from_fn(|_| ServiceEntry::default());
         let mut count = 0;
 
-        if let Some(cfg) = config {
-            if let Ok(Some(svc_str)) = cfg.get::<alloc::string::String>("services") {
+        if let Some(cfg) = config
+            && let Ok(Some(svc_str)) = cfg.get::<alloc::string::String>("services") {
                 for part in svc_str.split(',') {
                     let trimmed = part.trim();
                     let id = if let Some(hex) = trimmed.strip_prefix("0x") {
@@ -68,7 +69,6 @@ impl CuTask for SomeIpRouter {
                     }
                 }
             }
-        }
 
         Ok(Self {
             services,

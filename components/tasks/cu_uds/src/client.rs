@@ -130,21 +130,20 @@ impl CuTask for UdsClient {
         // P2 timeout: if awaiting and too much time has passed, give up
         if self.awaiting
             && self.request_sent_time.0 > 0
-            && now.saturating_sub(self.request_sent_time) > self.p2_timeout
+            && CuDuration::from(now.saturating_sub(self.request_sent_time)) > self.p2_timeout
         {
             self.awaiting = false;
             // Timeout — no response stored, client can check last_response == None
         }
 
         // Send next request if not awaiting
-        if !self.awaiting {
-            if let Some(pdu) = self.dequeue() {
+        if !self.awaiting
+            && let Some(pdu) = self.dequeue() {
                 output.set_payload(pdu);
                 output.tov = Tov::Time(now);
                 self.awaiting = true;
                 self.request_sent_time = now;
             }
-        }
         Ok(())
     }
 }

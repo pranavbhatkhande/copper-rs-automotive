@@ -18,9 +18,8 @@ mod signal_pack;
 mod toyota_checksum;
 
 use cu29::prelude::*;
-use cu29_helpers::basic_copper_setup;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[copper_runtime(config = "copperconfig.ron")]
 struct VehicleSimApplication {}
@@ -35,10 +34,9 @@ fn main() {
         fs::create_dir_all(parent).expect("Failed to create logs directory");
     }
 
-    let copper_ctx = basic_copper_setup(&PathBuf::from(logger_path), SLAB_SIZE, true, None)
-        .expect("Failed to setup logger.");
-    let mut application = VehicleSimApplicationBuilder::new()
-        .with_context(&copper_ctx)
+    let mut application = VehicleSimApplication::builder()
+        .with_log_path(logger_path, SLAB_SIZE)
+        .expect("Failed to setup logger.")
         .build()
         .expect("Failed to create vehicle simulation application.");
 

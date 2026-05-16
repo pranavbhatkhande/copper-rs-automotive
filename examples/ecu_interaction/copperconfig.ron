@@ -1,13 +1,14 @@
-// ECU Interaction Task Graph
+//! ECU Interaction Task Graph
+//! BodyEcu (source) → MeterEcu (transform) → DebugSink (sink)
 (
     tasks: [
         (
             id: "body",
-            type: "tasks::BodyEcu",
+            type: "crate::tasks::BodyEcu",
         ),
         (
             id: "meter",
-            type: "tasks::MeterEcu",
+            type: "crate::tasks::MeterEcu",
         ),
     ],
     cnx: [
@@ -16,11 +17,5 @@
             dst: "meter",
             msg: "cu_automotive_payloads::can::CanFrame",
         ),
-        (
-            src: "meter",
-            dst: "body",
-            msg: "cu_automotive_payloads::can::CanFrame",
-        ),
     ],
 )
-

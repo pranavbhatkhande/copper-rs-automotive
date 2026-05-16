@@ -15,10 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 cu29 = { workspace = true }
-cu29-helpers = { workspace = true }
 cu29-export = { workspace = true }
 cu29-unifiedlog = { workspace = true }
-cu-uds = { path = "../../components/tasks/cu_uds", version = "0.15.0" }
+cu-uds = { path = "../../components/tasks/cu_uds", version = "1.0.0-rc2" }
 cu-automotive-payloads = { workspace = true }
 serde = { workspace = true }
 

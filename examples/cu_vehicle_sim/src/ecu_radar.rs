@@ -18,7 +18,7 @@ use crate::toyota_checksum::apply_toyota_checksum;
 const NUM_TRACKS: usize = 16;
 
 /// Simulated state for one radar track.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Reflect)]
 struct TrackState {
     /// Is this track currently valid/active?
     valid: bool,

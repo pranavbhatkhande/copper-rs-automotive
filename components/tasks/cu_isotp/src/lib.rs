@@ -62,6 +62,7 @@ const DEFAULT_N_WFT_MAX: u8 = 10;
 
 /// State of ISO-TP reassembly (receiving side).
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 enum RxState {
     #[default]
     Idle,
@@ -81,6 +82,7 @@ enum RxState {
 
 /// State of ISO-TP segmentation (sending side).
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 enum TxState {
     #[default]
     Idle,
@@ -301,8 +303,7 @@ impl IsotpCodec {
                     ref mut wait_fc_count,
                     ..
                 } = self.tx_state
-                {
-                    if data.len() >= 3 {
+                    && data.len() >= 3 {
                         let fs = data[0] & 0x0F;
                         match fs {
                             0 => {
@@ -329,7 +330,6 @@ impl IsotpCodec {
                             _ => {}
                         }
                     }
-                }
                 (None, None)
             }
         }
@@ -360,7 +360,7 @@ impl IsotpCodec {
                 return None;
             }
             // Enforce STmin: wait until enough time has elapsed since last CF
-            if stmin.0 > 0 && now.saturating_sub(*last_cf_time) < stmin {
+            if stmin.0 > 0 && CuDuration::from(now.saturating_sub(*last_cf_time)) < stmin {
                 return None;
             }
             let remaining = total_len - *offset;
@@ -458,7 +458,7 @@ impl CuTask for IsotpCodec {
             fc_params: FlowControlParams {
                 status: FlowStatus::ContinueToSend,
                 block_size: bs,
-                st_min: st_min,
+                st_min,
             },
             addressing: IsotpAddressingMode::Normal,
             rx_state: RxState::Idle,
@@ -481,22 +481,19 @@ impl CuTask for IsotpCodec {
 
         // --- Timeout checks ---
         // RX: abort if waiting too long for next CF
-        if let RxState::Receiving { last_cf_time, .. } = &self.rx_state {
-            if now.saturating_sub(*last_cf_time) > self.n_cr_timeout {
+        if let RxState::Receiving { last_cf_time, .. } = &self.rx_state
+            && CuDuration::from(now.saturating_sub(*last_cf_time)) > self.n_cr_timeout {
                 self.rx_state = RxState::Idle;
             }
-        }
         // TX: abort if waiting too long for FC
         if let TxState::Sending {
             waiting_fc: true,
             fc_wait_start,
             ..
         } = &self.tx_state
-        {
-            if now.saturating_sub(*fc_wait_start) > self.n_bs_timeout {
+            && CuDuration::from(now.saturating_sub(*fc_wait_start)) > self.n_bs_timeout {
                 self.tx_state = TxState::Idle;
             }
-        }
 
         // --- RX path: CAN frame → reassembled ISO-TP PDU ---
         if let Some(frame) = can_input.payload() {
@@ -517,14 +514,13 @@ impl CuTask for IsotpCodec {
         }
 
         // --- TX path: upper-layer PDU → segmented CAN frames ---
-        if let Some(pdu) = isotp_input.payload() {
-            if let Some(mut frame) = self.start_tx(pdu, now) {
+        if let Some(pdu) = isotp_input.payload()
+            && let Some(mut frame) = self.start_tx(pdu, now) {
                 frame.id = self.tx_can_id;
                 can_output.set_payload(frame);
                 can_output.tov = Tov::Time(now);
                 return Ok(());
             }
-        }
 
         // Continue any in-progress multi-frame TX
         if let Some(mut frame) = self.tx_next_frame(now) {

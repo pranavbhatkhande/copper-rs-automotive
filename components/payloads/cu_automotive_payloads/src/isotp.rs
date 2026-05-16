@@ -40,8 +40,10 @@ pub enum IsotpAddressingMode {
 
 /// Classification of an ISO-TP protocol data unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
+#[derive(Default)]
 pub enum IsotpFrameType {
     /// Single Frame — entire message fits in one CAN frame.
+    #[default]
     SingleFrame,
     /// First Frame — start of a multi-frame transfer.
     FirstFrame,
@@ -51,11 +53,6 @@ pub enum IsotpFrameType {
     FlowControl,
 }
 
-impl Default for IsotpFrameType {
-    fn default() -> Self {
-        Self::SingleFrame
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Flow control status

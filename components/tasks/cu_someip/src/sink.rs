@@ -17,14 +17,18 @@ const TX_BUF_SIZE: usize = SOMEIP_HEADER_SIZE + SOMEIP_MAX_PAYLOAD_SIZE;
 #[derive(Reflect)]
 #[reflect(from_reflect = false)]
 pub struct SomeIpSink {
-    #[allow(dead_code)]
     remote_addr: alloc::string::String,
-    #[allow(dead_code)]
     remote_port: u16,
     #[cfg(all(target_os = "linux", not(feature = "mock")))]
     fd: i32,
     #[cfg(all(target_os = "linux", not(feature = "mock")))]
-    dest: libc::sockaddr_in,
+    dest_sin_family: u16,
+    #[cfg(all(target_os = "linux", not(feature = "mock")))]
+    dest_sin_port: u16,
+    #[cfg(all(target_os = "linux", not(feature = "mock")))]
+    dest_sin_addr: u32,
+    #[cfg(all(target_os = "linux", not(feature = "mock")))]
+    dest_sin_zero: [u8; 8],
     #[cfg(feature = "mock")]
     tx_count: u64,
 }
@@ -51,7 +55,17 @@ impl CuSinkTask for SomeIpSink {
         };
 
         #[cfg(all(target_os = "linux", not(feature = "mock")))]
-        let (fd, dest) = {
+        let (fd, ip_addr) = {
+            let ip_parts: alloc::vec::Vec<u8> = remote_addr
+                .split('.')
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let ip_addr: u32 = if ip_parts.len() == 4 {
+                u32::from_be_bytes([ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]])
+            } else {
+                0x7f000001 // 127.0.0.1
+            };
+
             unsafe {
                 let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
                 if fd < 0 {
@@ -59,27 +73,7 @@ impl CuSinkTask for SomeIpSink {
                         "Failed to create UDP socket for SOME/IP sink",
                     ));
                 }
-
-                let ip_parts: alloc::vec::Vec<u8> = remote_addr
-                    .split('.')
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                let ip_addr: u32 = if ip_parts.len() == 4 {
-                    u32::from_be_bytes([ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]])
-                } else {
-                    0x7f000001 // 127.0.0.1
-                };
-
-                let dest = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as u16,
-                    sin_port: remote_port.to_be(),
-                    sin_addr: libc::in_addr {
-                        s_addr: ip_addr.to_be(),
-                    },
-                    sin_zero: [0; 8],
-                };
-
-                (fd, dest)
+                (fd, ip_addr)
             }
         };
 
@@ -89,7 +83,13 @@ impl CuSinkTask for SomeIpSink {
             #[cfg(all(target_os = "linux", not(feature = "mock")))]
             fd,
             #[cfg(all(target_os = "linux", not(feature = "mock")))]
-            dest,
+            dest_sin_family: libc::AF_INET as u16,
+            #[cfg(all(target_os = "linux", not(feature = "mock")))]
+            dest_sin_port: remote_port.to_be(),
+            #[cfg(all(target_os = "linux", not(feature = "mock")))]
+            dest_sin_addr: ip_addr.to_be(),
+            #[cfg(all(target_os = "linux", not(feature = "mock")))]
+            dest_sin_zero: [0; 8],
             #[cfg(feature = "mock")]
             tx_count: 0,
         })
@@ -101,13 +101,21 @@ impl CuSinkTask for SomeIpSink {
             {
                 let mut buf = [0u8; TX_BUF_SIZE];
                 let len = _msg.to_wire(&mut buf);
+                let dest = libc::sockaddr_in {
+                    sin_family: self.dest_sin_family,
+                    sin_port: self.dest_sin_port,
+                    sin_addr: libc::in_addr {
+                        s_addr: self.dest_sin_addr,
+                    },
+                    sin_zero: self.dest_sin_zero,
+                };
                 unsafe {
                     let n = libc::sendto(
                         self.fd,
                         buf.as_ptr() as *const libc::c_void,
                         len,
                         0,
-                        &self.dest as *const libc::sockaddr_in as *const libc::sockaddr,
+                        &dest as *const libc::sockaddr_in as *const libc::sockaddr,
                         core::mem::size_of::<libc::sockaddr_in>() as u32,
                     );
                     if n < 0 {

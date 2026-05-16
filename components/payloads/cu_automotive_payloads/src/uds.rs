@@ -45,11 +45,13 @@ impl From<u8> for UdsSessionType {
 /// Well-known UDS Service Identifiers (SID).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum UdsServiceId {
     DiagnosticSessionControl = 0x10,
     EcuReset = 0x11,
     SecurityAccess = 0x27,
     CommunicationControl = 0x28,
+    #[default]
     TesterPresent = 0x3E,
     ControlDtcSetting = 0x85,
     ReadDataByIdentifier = 0x22,
@@ -65,11 +67,6 @@ pub enum UdsServiceId {
     NegativeResponse = 0x7F,
 }
 
-impl Default for UdsServiceId {
-    fn default() -> Self {
-        Self::TesterPresent
-    }
-}
 
 impl From<u8> for UdsServiceId {
     fn from(v: u8) -> Self {

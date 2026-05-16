@@ -13,6 +13,7 @@ const MAX_TRACKED_SERVICES: usize = 32;
 
 /// Known service availability record.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "reflect", derive(Reflect))]
 struct TrackedService {
     service_id: u16,
     instance_id: u16,
